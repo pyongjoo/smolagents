@@ -225,6 +225,11 @@ class ParallelPlanningStep(PlanningStep):
     graph_snapshot_yaml: str = ""
     new_task_ids: list[str] = None  # type: ignore[assignment]
     next_trigger: dict = None  # type: ignore[assignment]
+    # The trigger that caused this planning call to be invoked. For
+    # the very first planning pass there is no prior trigger, so
+    # ``invoked_by`` is ``None`` — downstream consumers can treat that
+    # as "initial planning".
+    invoked_by: dict | None = None
 
     def __post_init__(self):
         if self.new_task_ids is None:
@@ -248,6 +253,11 @@ class ParallelTaskStep(ActionStep):
     dependencies: list[str] = None  # type: ignore[assignment]
     expected_runtime_s: float | None = None
     resources: list[str] = None  # type: ignore[assignment]
+    # Wall-clock time the planner created this task. ``timing`` already
+    # carries the execution window (``start_time`` → ``end_time``);
+    # ``created_at`` lets consumers tell how long a task waited in the
+    # graph before being scheduled.
+    created_at: float | None = None
 
     def __post_init__(self):
         if self.dependencies is None:

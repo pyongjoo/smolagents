@@ -64,14 +64,22 @@ WorkerCallable = Callable[[Any], "TaskResult"]
 
 @dataclass
 class TaskResult:
-    """Return value produced by a worker on successful task completion."""
+    """Return value produced by a worker on successful task completion.
+
+    ``action_steps`` is a list of dicts (one per inner ReAct step, as
+    produced by :meth:`AgentMemory.get_full_steps`) and is what the
+    outer agent iterates over to render per-phase boxed prints on the
+    main thread — keeping concurrent task output from interleaving.
+    """
 
     task_id: str
     output: Any
-    action_steps: list[Any]  # list of dicts, one per inner ActionStep
+    action_steps: list[Any]
     logs: str = ""
     input_tokens: int = 0
     output_tokens: int = 0
+    started_at: float | None = None
+    finished_at: float | None = None
 
 
 class SchedulerFailure(RuntimeError):
@@ -206,5 +214,5 @@ class ParallelScheduler:
                     ),
                 )
             task.result = result.output
-            events.append(TaskCompletedEvent(task=task))
+            events.append(TaskCompletedEvent(task=task, result=result))
         return events

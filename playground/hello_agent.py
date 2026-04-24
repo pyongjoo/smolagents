@@ -1,7 +1,10 @@
-from smolagents import CodeAgent, LiteLLMModel
-import litellm
 import os
+
+import litellm
 from dotenv import load_dotenv
+
+from smolagents import CodeAgent, LiteLLMModel
+
 
 # Load environment variables from .env file (override any existing ones)
 load_dotenv(override=True)

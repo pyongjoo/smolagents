@@ -21,11 +21,19 @@ when they opt in explicitly (see design doc §11).
 """
 from __future__ import annotations
 
+import threading
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
+from datetime import datetime
 from logging import getLogger
 from typing import TYPE_CHECKING, Any, Literal
+
+from rich import box
+from rich.panel import Panel
+from rich.syntax import Syntax
+from rich.table import Table
+from rich.text import Text
 
 from smolagents.agents import CodeAgent
 from smolagents.memory import (
@@ -33,7 +41,7 @@ from smolagents.memory import (
     ParallelTaskStep,
 )
 from smolagents.models import ChatMessage
-from smolagents.monitoring import LogLevel, Timing
+from smolagents.monitoring import YELLOW_HEX, LogLevel, Timing
 from smolagents.parallel.events import (
     PlanningTriggeredEvent,
     TaskCompletedEvent,
@@ -88,6 +96,13 @@ class TaskWorkerSpec:
     code_block_tags: tuple[str, str] | Literal["markdown"] | None
     use_structured_outputs_internally: bool
     instructions: str | None
+    # Optional real-time step callback. When provided, the worker
+    # registers it on the inner agent so each inner ActionStep is
+    # reported as soon as it finishes — letting the outer agent print
+    # panels live instead of waiting until the whole task completes.
+    # Must be None for process-pool execution (closures aren't
+    # picklable); the outer agent attaches it only in thread mode.
+    step_callback: Callable[[Any], None] | None = None
 
 
 def run_task_worker(spec: TaskWorkerSpec) -> TaskResult:
@@ -98,6 +113,15 @@ def run_task_worker(spec: TaskWorkerSpec) -> TaskResult:
     the planner's goal. The loop is exactly the standard Thought →
     Code → Observation loop today's :class:`CodeAgent` uses — this is
     where task-level LLM calls happen.
+
+    The inner agent is silenced (``verbosity_level=LogLevel.OFF``) so
+    its logs don't interleave with other concurrent workers on stdout.
+    In thread mode the outer agent passes a ``step_callback`` that
+    gets invoked after each inner ActionStep; panels are printed live
+    under a shared lock so they still appear grouped per step. In
+    process mode the callback is omitted (closures aren't picklable)
+    and the outer agent iterates ``action_steps`` on completion
+    instead.
     """
     agent = CodeAgent(
         tools=list(spec.tools),
@@ -108,19 +132,20 @@ def run_task_worker(spec: TaskWorkerSpec) -> TaskResult:
         use_structured_outputs_internally=spec.use_structured_outputs_internally,
         instructions=spec.instructions,
         return_full_result=True,
+        verbosity_level=LogLevel.OFF,
     )
 
-    # Seed the worker's sandbox with completed dependency results,
-    # bound to variables named after the dependency task ids.
+    if spec.step_callback is not None:
+        agent.step_callbacks.register(ActionStep, spec.step_callback)
+
     if spec.dependency_results:
         agent.state.update(spec.dependency_results)
 
-    # The planner's high-level goal becomes the outer task for the
-    # mini-agent. No concrete steps are injected here — the worker's
-    # own LLM is expected to decide how to achieve the goal.
     inner_task = _build_inner_task_text(spec)
 
+    started_at = time.time()
     run_result = agent.run(inner_task)
+    finished_at = time.time()
     output = run_result.output
     steps = run_result.steps or []
     token_usage = run_result.token_usage
@@ -136,6 +161,8 @@ def run_task_worker(spec: TaskWorkerSpec) -> TaskResult:
         logs=logs,
         input_tokens=token_usage.input_tokens if token_usage is not None else 0,
         output_tokens=token_usage.output_tokens if token_usage is not None else 0,
+        started_at=started_at,
+        finished_at=finished_at,
     )
 
 
@@ -225,6 +252,11 @@ class ParallelCodeAgent(CodeAgent):
         self.executor_kind = executor_kind
         self.max_planning_calls = max_planning_calls
         self.planner = ParallelPlanner(model=self.model, logger=self.logger)
+        # Shared print lock + per-task visible-step counter. In thread
+        # mode worker callbacks fire from the pool threads and grab
+        # this lock to print a step's three panels atomically.
+        self._print_lock = threading.Lock()
+        self._visible_steps_by_task: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Override the ReAct loop with the parallel orchestration loop.
@@ -244,6 +276,7 @@ class ParallelCodeAgent(CodeAgent):
 
         graph = TaskGraph()
         state = _PlanningState()
+        self._visible_steps_by_task = {}
 
         with ParallelScheduler(
             build_spec=lambda t, g: self._build_worker_spec(t, g),
@@ -284,7 +317,7 @@ class ParallelCodeAgent(CodeAgent):
 
                 for event in completion_events:
                     if isinstance(event, TaskCompletedEvent):
-                        self._integrate_completion(event.task, graph, state)
+                        self._integrate_completion(event.task, event.result, graph, state)
                     yield event
 
                 if self._should_replan(state, graph):
@@ -308,26 +341,89 @@ class ParallelCodeAgent(CodeAgent):
             )
         state.planning_calls += 1
 
-        self.logger.log_rule("Parallel planning", level=LogLevel.INFO)
         yield PlanningTriggeredEvent(trigger=state.trigger)
 
-        result = self.planner.plan(task=task, memory=self.memory, graph=graph)
-        graph.add_tasks(result.new_tasks)
+        # The trigger active at the moment we decide to call the
+        # planner is what caused *this* invocation. We stash it before
+        # the call so the rendered panel and memory step both reflect
+        # why planning is happening now. ``None`` means the first
+        # call, which was forced by the empty-graph bootstrap rather
+        # than by any trigger firing.
+        invoked_by_trigger = None if state.planning_calls == 1 else state.trigger
 
+        # Wall-clock timings captured around the LLM call so the
+        # rendered panel can show how the planning phase overlaps
+        # with already-running tasks.
+        plan_start = time.time()
+        result = self.planner.plan(task=task, memory=self.memory, graph=graph)
+        plan_end = time.time()
+
+        graph.add_tasks(result.new_tasks)
+        # Attach the "what caused this call" metadata so downstream
+        # consumers (e.g. the final summary, saved memory dumps) can
+        # reconstruct the planning lineage.
+        result.planning_step.invoked_by = (
+            invoked_by_trigger.to_dict() if invoked_by_trigger is not None else None
+        )
         self.memory.steps.append(result.planning_step)
         self._finalize_step(result.planning_step)
 
         state.trigger = result.next_trigger
         state.completions_since_last_plan = 0
 
-        self.logger.log(
-            f"Planner added {len(result.new_tasks)} new task(s); "
-            f"next trigger: {result.next_trigger.to_dict()}",
-            level=LogLevel.INFO,
+        self._log_planning_panel(
+            call_index=state.planning_calls,
+            plan_start=plan_start,
+            plan_end=plan_end,
+            new_tasks=result.new_tasks,
+            next_trigger=result.next_trigger,
+            invoked_by=invoked_by_trigger,
         )
         self.logger.log(graph.to_yaml(), level=LogLevel.DEBUG)
 
         yield result.planning_step
+
+    def _log_planning_panel(
+        self,
+        *,
+        call_index: int,
+        plan_start: float,
+        plan_end: float,
+        new_tasks: list[Task],
+        next_trigger: NextPlanningTrigger,
+        invoked_by: NextPlanningTrigger | None,
+    ) -> None:
+        """Render the outcome of one planner LLM call as a bounding box."""
+        body = Text()
+        body.append("invoked: ", style="dim")
+        body.append(f"{_describe_trigger(invoked_by)}\n", style="bold")
+        body.append("next planning: ", style="dim")
+        body.append(f"{_describe_trigger(next_trigger)}\n", style="bold")
+        body.append(f"added {len(new_tasks)} new task(s)\n", style="bold")
+        if not new_tasks:
+            body.append("(no new tasks)\n", style="dim")
+        for t in new_tasks:
+            deps = t.dependencies if t.dependencies else []
+            runtime = f"{t.expected_runtime_s:g}s" if t.expected_runtime_s is not None else "?"
+            body.append(f"  + {t.id} ", style="bold cyan")
+            body.append(f"(deps={deps or '[]'}, ~{runtime}): ", style="dim")
+            body.append(f"{t.goal}\n")
+
+        title = (
+            f"[bold]Parallel planning · call #{call_index} · "
+            f"start={_fmt_ts(plan_start)} · end={_fmt_ts(plan_end)} · "
+            f"duration={plan_end - plan_start:.2f}s"
+        )
+        self.logger.log(
+            Panel(
+                body,
+                title=title,
+                border_style=YELLOW_HEX,
+                title_align="left",
+                box=box.ROUNDED,
+            ),
+            level=LogLevel.INFO,
+        )
 
     def _should_replan(
         self,
@@ -357,6 +453,7 @@ class ParallelCodeAgent(CodeAgent):
     def _integrate_completion(
         self,
         task: Task,
+        result: "TaskResult | None",
         graph: TaskGraph,
         state: _PlanningState,
     ) -> None:
@@ -367,8 +464,143 @@ class ParallelCodeAgent(CodeAgent):
         memory_step = self._make_parallel_task_step(task)
         graph.mark_completed(task.id, task.result, memory_step=memory_step)
         self.memory.steps.append(memory_step)
-        self._finalize_step(memory_step)
+        # Intentionally do NOT call ``self._finalize_step`` here: the
+        # default ``Monitor.update_metrics`` callback (registered for
+        # ActionStep) would print lines like
+        # ``[Step 3: Duration 0.42 seconds]`` that falsely imply a
+        # sequential step counter. Parallel tasks have per-task
+        # timings that we render separately in the summary table.
+        memory_step.timing.end_time = time.time()
         state.completions_since_last_plan += 1
+
+        # In thread mode each step was already printed live via
+        # ``_emit_step_panels_live`` from the worker thread. Process
+        # mode has no live channel (closures aren't picklable), so we
+        # fall back to the batch path that replays all action steps
+        # here.
+        if result is not None and self.executor_kind != "thread":
+            self._emit_task_panels(task, result)
+
+    # ------------------------------------------------------------------
+    # Per-task rendering
+    # ------------------------------------------------------------------
+    def _emit_task_panels(self, task: Task, result: "TaskResult") -> None:
+        """Replay all inner steps of a completed task as panels.
+
+        Used only in process mode; thread mode prints each step live
+        as the worker finishes it.
+        """
+        for raw in result.action_steps:
+            step = raw if isinstance(raw, dict) else _action_step_to_dict(raw)
+            if step is None:
+                continue
+            self._emit_step_panels(task.id, step)
+
+    def _emit_step_panels_live(self, task_id: str, memory_step: Any) -> None:
+        """Step callback installed on inner agents in thread mode.
+
+        Runs on the worker thread. Converts the finished ``ActionStep``
+        to a dict and prints its panels under ``_print_lock`` so the
+        three phase boxes for a single step never interleave with
+        output from a concurrent worker.
+        """
+        try:
+            step_dict = memory_step.dict()
+        except Exception:
+            return
+        with self._print_lock:
+            self._emit_step_panels(task_id, step_dict)
+
+    def _emit_step_panels(self, task_id: str, step: dict) -> None:
+        """Print up to three bounding boxes for one inner action step.
+
+        ``step`` is the dict form of a worker's :class:`ActionStep`.
+        We skip entries that carry no renderable phase (e.g. the
+        initial ``TaskStep`` that leads the worker's memory) so the
+        visible ``step=N`` label counts only action-bearing steps.
+        """
+        model_output = step.get("model_output")
+        code_action = step.get("code_action")
+        observations = step.get("observations")
+        action_output = step.get("action_output")
+        error = step.get("error")
+        if not (
+            model_output
+            or code_action
+            or observations
+            or action_output is not None
+            or error
+        ):
+            return
+
+        visible_step = self._visible_steps_by_task.get(task_id, 0) + 1
+        self._visible_steps_by_task[task_id] = visible_step
+
+        timing = step.get("timing") or {}
+        s_start = timing.get("start_time")
+        s_end = timing.get("end_time")
+        # Titles follow a fixed order so every panel is easy to scan:
+        # task-id · step · phase · start · end.
+        def _title(phase: str) -> str:
+            return (
+                f"[bold]{task_id} · step={visible_step} · {phase} · "
+                f"start={_fmt_ts(s_start)} · end={_fmt_ts(s_end)}"
+            )
+
+        if model_output:
+            self.logger.log(
+                Panel(
+                    Text(_short_result(model_output, 4000), overflow="fold"),
+                    title=_title("LLM response"),
+                    border_style="cyan",
+                    title_align="left",
+                    box=box.ROUNDED,
+                ),
+                level=LogLevel.INFO,
+            )
+
+        if code_action:
+            self.logger.log(
+                Panel(
+                    Syntax(
+                        code_action,
+                        lexer="python",
+                        theme="monokai",
+                        word_wrap=True,
+                    ),
+                    title=_title("Code execution"),
+                    border_style="magenta",
+                    title_align="left",
+                    box=box.ROUNDED,
+                ),
+                level=LogLevel.INFO,
+            )
+
+        obs_text: str | None = None
+        if observations:
+            obs_text = _short_result(observations, 2000)
+        elif action_output is not None:
+            obs_text = _short_result(action_output, 2000)
+
+        if obs_text or error:
+            body_parts: list[Any] = []
+            if obs_text:
+                body_parts.append(Text(obs_text, overflow="fold"))
+            if error:
+                body_parts.append(
+                    Text(f"error: {error}", style="bold red", overflow="fold")
+                )
+            body = body_parts[0] if len(body_parts) == 1 else Text("\n").join(body_parts)
+            self.logger.log(
+                Panel(
+                    body,
+                    title=_title("Observation"),
+                    border_style="green" if not error else "red",
+                    title_align="left",
+                    box=box.ROUNDED,
+                ),
+                level=LogLevel.INFO,
+            )
 
     def _make_parallel_task_step(self, task: Task) -> ParallelTaskStep:
         duration = task.actual_runtime_s or 0.0
@@ -389,6 +621,7 @@ class ParallelCodeAgent(CodeAgent):
             dependencies=list(task.dependencies),
             expected_runtime_s=task.expected_runtime_s,
             resources=list(task.resources),
+            created_at=task.created_at,
         )
 
     # ------------------------------------------------------------------
@@ -420,11 +653,64 @@ class ParallelCodeAgent(CodeAgent):
             except Exception as exc:  # noqa: BLE001
                 self.logger.log(f"provide_final_answer fallback failed: {exc}", level=LogLevel.INFO)
 
-        self.logger.log(graph.to_yaml(), level=LogLevel.INFO)
+        self._log_task_summary(graph)
+        # Keep the plain-YAML snapshot around at DEBUG for users who
+        # want a machine-readable dump of the whole graph.
+        self.logger.log(graph.to_yaml(), level=LogLevel.DEBUG)
 
         final_answer_step = FinalAnswerStep(output=handle_agent_output_types(final_answer))
         self._finalize_step(final_answer_step)
         yield final_answer_step
+
+    # ------------------------------------------------------------------
+    # Final summary table
+    # ------------------------------------------------------------------
+    def _log_task_summary(self, graph: TaskGraph) -> None:
+        """Render a per-task summary table with creation/start/end times."""
+        table = Table(
+            title="Parallel task summary",
+            box=box.ROUNDED,
+            title_style="bold",
+            show_lines=False,
+            header_style="bold",
+        )
+        table.add_column("Task")
+        table.add_column("Status")
+        table.add_column("Deps")
+        table.add_column("Goal")
+        table.add_column("Created")
+        table.add_column("Started")
+        table.add_column("Finished")
+        table.add_column("Duration", justify="right")
+        table.add_column("Expected", justify="right")
+
+        status_styles = {
+            TaskStatus.COMPLETED: "green",
+            TaskStatus.FAILED: "red",
+            TaskStatus.RUNNING: "yellow",
+            TaskStatus.PENDING: "dim",
+            TaskStatus.READY: "cyan",
+        }
+
+        for t in graph.all_tasks():
+            goal = t.goal.strip().splitlines()[0] if t.goal else ""
+            if len(goal) > 72:
+                goal = goal[:71] + "…"
+            actual = t.actual_runtime_s
+            expected = t.expected_runtime_s
+            table.add_row(
+                t.id,
+                Text(t.status.value, style=status_styles.get(t.status, "")),
+                ",".join(t.dependencies) if t.dependencies else "-",
+                goal,
+                _fmt_ts(t.created_at),
+                _fmt_ts(t.started_at),
+                _fmt_ts(t.finished_at),
+                f"{actual:.2f}s" if actual is not None else "-",
+                f"~{expected:.0f}s" if expected is not None else "-",
+            )
+
+        self.logger.log(table, level=LogLevel.INFO)
 
     # ------------------------------------------------------------------
     # Worker spec
@@ -434,6 +720,18 @@ class ParallelCodeAgent(CodeAgent):
         for dep_id in task.dependencies:
             dep = graph.get(dep_id)
             dependency_results[dep_id] = dep.result
+
+        # Live step callback is only safe in thread mode — process
+        # pools would need to pickle the closure, which won't work.
+        step_callback: Callable[[Any], None] | None = None
+        if self.executor_kind == "thread":
+            task_id = task.id
+
+            def on_inner_step(memory_step: Any) -> None:
+                self._emit_step_panels_live(task_id, memory_step)
+
+            step_callback = on_inner_step
+
         return TaskWorkerSpec(
             task_id=task.id,
             task_goal=task.goal,
@@ -446,6 +744,7 @@ class ParallelCodeAgent(CodeAgent):
             code_block_tags=self.code_block_tags,
             use_structured_outputs_internally=self._use_structured_outputs_internally,
             instructions=self.instructions,
+            step_callback=step_callback,
         )
 
 
@@ -456,3 +755,46 @@ def _short_result(result: Any, max_len: int = 500) -> str:
     if len(text) > max_len:
         text = text[: max_len - 1] + "…"
     return text
+
+
+def _fmt_ts(ts: float | None) -> str:
+    if ts is None:
+        return "--:--:--.---"
+    return datetime.fromtimestamp(ts).strftime("%H:%M:%S.%f")[:-3]
+
+
+def _action_step_to_dict(step: Any) -> dict | None:
+    """Fallback serializer when the worker returned raw step objects."""
+    try:
+        return step.dict()
+    except Exception:
+        return None
+
+
+def _describe_trigger(
+    trigger: "NextPlanningTrigger | dict | None",
+) -> str:
+    """Render a ``NextPlanningTrigger`` (or its serialized dict form)
+    as a short human-readable phrase.
+
+    Accepts either the live dataclass (as used by the agent) or the
+    serialized dict form (as stored on :class:`ParallelPlanningStep`)
+    so the same helper can drive the live panel and post-run
+    summaries.
+    """
+    if trigger is None:
+        return "initial planning (empty graph)"
+    d = trigger.to_dict() if hasattr(trigger, "to_dict") else dict(trigger)
+    kind = d.get("kind", "never")
+    if kind == "never":
+        return "never — this is a terminal plan"
+    if kind == "after_task":
+        tid = d.get("task_id") or "?"
+        return f"after task {tid} completes"
+    if kind == "after_n_completions":
+        n = d.get("n")
+        if isinstance(n, int):
+            noun = "completion" if n == 1 else "completions"
+            return f"after {n} more task {noun}"
+        return "after N more task completions"
+    return str(d)

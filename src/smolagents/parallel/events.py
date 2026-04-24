@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from smolagents.parallel.planner import NextPlanningTrigger
+    from smolagents.parallel.scheduler import TaskResult
     from smolagents.parallel.task_graph import Task
 
 
@@ -62,9 +63,15 @@ class TaskStartedEvent:
 
 @dataclass
 class TaskCompletedEvent:
-    """Emitted when a task finished successfully (status = COMPLETED)."""
+    """Emitted when a task finished successfully (status = COMPLETED).
+
+    ``result`` carries the full worker return value (output, trace,
+    token usage, etc.) so the outer agent can render the task's trace
+    atomically and merge token counts into the monitor.
+    """
 
     task: "Task"
+    result: "TaskResult | None" = None
 
 
 @dataclass
