@@ -34,7 +34,22 @@ planning: |-
        existing tasks)
      - `goal` (concise natural-language description of *what* the task
        should accomplish — NEVER include code, tool names, or
-       step-by-step instructions)
+       step-by-step instructions). The `goal` MUST be **self-contained**:
+       the sub-agent only sees this string plus the upstream dependency
+       variables, NOT the rest of the plan or the other tasks' goals.
+       That means:
+         * Inline every literal requirement from the user task that
+           the sub-agent needs to satisfy its share: exact output
+           schemas (dict keys, field names), units, formats, ranges,
+           constants, success criteria, etc.
+         * Do NOT say "the requested output", "the format above",
+           "as the user asked", or similar back-references — quote
+           the concrete requirement instead.
+         * For a terminal aggregator that calls `final_answer`, the
+           goal MUST spell out the exact final shape/schema so the
+           worker can produce it verbatim (e.g. `{"fib_25": task_1,
+           "fact_10": task_2, ...}`), not just say "combine the
+           results".
      - `dependencies` (list of task ids that must complete before this
        task starts; use existing ids or ids introduced in this same
        call; `[]` if none)
@@ -91,7 +106,12 @@ planning: |-
       expected_runtime_s: 30
       resources: []
     - id: task_5
-      goal: Combine the three summaries from task_2, task_3, task_4 into a single answer and call final_answer with it.
+      goal: |
+        Build a single string of the form
+        "1) <summary1>\n2) <summary2>\n3) <summary3>" where <summary1>,
+        <summary2>, <summary3> are the values of variables `task_2`,
+        `task_3`, `task_4` respectively, and call `final_answer` with
+        that string.
       dependencies: [task_2, task_3, task_4]
       expected_runtime_s: 15
       resources: []
@@ -134,7 +154,58 @@ planning: |-
   ```
 
   ---
-  ## Example 3 — Simple single-shot task
+  ## Example 3 — Self-contained aggregator with a strict schema
+
+  User task: |
+    Compute three things and return them as a dict:
+      A. 2 + 2
+      B. 3 * 3
+      C. 10 - 1
+    Final answer must be exactly {"sum": A, "product": B, "difference": C}.
+
+  Current graph:
+  ```yaml
+  tasks: []
+  ```
+
+  Output:
+  ```yaml
+  reasoning: |
+    Three independent arithmetic tasks plus one aggregator that must
+    produce the exact dict schema the user asked for. I inline the
+    schema in the aggregator's goal so the worker does not have to
+    guess the keys.
+  new_tasks:
+    - id: task_1
+      goal: Compute 2 + 2 and return the integer result via final_answer.
+      dependencies: []
+      expected_runtime_s: 2
+      resources: []
+    - id: task_2
+      goal: Compute 3 * 3 and return the integer result via final_answer.
+      dependencies: []
+      expected_runtime_s: 2
+      resources: []
+    - id: task_3
+      goal: Compute 10 - 1 and return the integer result via final_answer.
+      dependencies: []
+      expected_runtime_s: 2
+      resources: []
+    - id: task_4
+      goal: |
+        Call `final_answer` with the Python dict
+        {"sum": task_1, "product": task_2, "difference": task_3}
+        using exactly those three string keys in that order. Do not
+        add, rename, or omit any keys.
+      dependencies: [task_1, task_2, task_3]
+      expected_runtime_s: 2
+      resources: []
+  next_planning:
+    kind: never
+  ```
+
+  ---
+  ## Example 4 — Simple single-shot task
 
   User task: "What is 17 * 23?"
 

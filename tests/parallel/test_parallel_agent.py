@@ -172,6 +172,44 @@ class TestParallelAgentEndToEnd:
         result = agent.run("Add two plus three.")
         assert result == 5
 
+    def test_worker_prompt_includes_user_task(self):
+        """Workers must receive the full user task as read-only context.
+
+        This guards against regressions of the "the requested
+        dictionary" failure mode where the planner's terse goal
+        back-references a schema only the user task spells out.
+        """
+        seen_prompts: list[str] = []
+
+        class RecordingModel(ScriptedPlannerAndCoderModel):
+            def generate(self, messages, stop_sequences=None, **kwargs):
+                prompt = _stringify(messages)
+                if "planning assistant for a parallel agent runtime" not in prompt:
+                    seen_prompts.append(prompt)
+                return super().generate(messages, stop_sequences=stop_sequences, **kwargs)
+
+        model = RecordingModel(
+            planning_outputs=[SINGLE_TASK_PLAN],
+            worker_outputs={"task_1": WORKER_MUL},
+        )
+        agent = ParallelCodeAgent(
+            tools=[],
+            model=model,
+            max_parallel_tasks=1,
+            max_task_steps=3,
+            executor_kind="thread",
+        )
+        user_task = "What is 17 * 23?"
+        agent.run(user_task)
+
+        assert seen_prompts, "Worker was never invoked."
+        worker_prompt = seen_prompts[0]
+        assert user_task in worker_prompt, (
+            "Worker prompt must include the original user task verbatim.\n"
+            f"Prompt was:\n{worker_prompt[:800]}"
+        )
+        assert "Overall user task" in worker_prompt
+
     def test_parallel_execution_flag_on_codeagent(self):
         model = ScriptedPlannerAndCoderModel(
             planning_outputs=[SINGLE_TASK_PLAN],

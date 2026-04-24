@@ -89,6 +89,12 @@ class TaskWorkerSpec:
     task_goal: str
     task_dependencies: list[str]
     dependency_results: dict[str, Any]
+    # The original end-user task. Included verbatim in the worker
+    # prompt as read-only context so sub-agents can resolve
+    # back-references in their goal (e.g. "the requested dictionary")
+    # to the literal schema/values the user asked for. Workers must
+    # still treat ``task_goal`` as the scope of their own work.
+    user_task: str
     model: "Model"
     tools: list["Tool"]
     additional_authorized_imports: list[str]
@@ -169,8 +175,20 @@ def run_task_worker(spec: TaskWorkerSpec) -> TaskResult:
 def _build_inner_task_text(spec: TaskWorkerSpec) -> str:
     lines = [
         f"You are executing sub-task `{spec.task_id}` of a larger parallel plan.",
+    ]
+    # Pass the original user task as read-only context so the worker
+    # can resolve any back-references in its goal (e.g. "the requested
+    # dictionary") to the literal schema or values the user asked
+    # for. The worker must still only do the work scoped by ``Goal``.
+    if spec.user_task:
+        lines += [
+            "",
+            "Overall user task (for context only — do NOT try to solve it in full):",
+            spec.user_task.strip(),
+        ]
+    lines += [
         "",
-        "Goal:",
+        "Goal (this is what YOU must accomplish):",
         spec.task_goal,
     ]
     if spec.task_dependencies:
@@ -184,7 +202,10 @@ def _build_inner_task_text(spec: TaskWorkerSpec) -> str:
     lines += [
         "",
         "When you are done, call `final_answer(<result>)` with the value "
-        "your downstream consumers (or the user) will need.",
+        "your downstream consumers (or the user) will need. If your goal "
+        "is the terminal aggregator, make sure the value you pass to "
+        "`final_answer` matches the exact shape/schema the overall user "
+        "task requires.",
     ]
     return "\n".join(lines)
 
@@ -257,6 +278,7 @@ class ParallelCodeAgent(CodeAgent):
         # this lock to print a step's three panels atomically.
         self._print_lock = threading.Lock()
         self._visible_steps_by_task: dict[str, int] = {}
+        self._current_user_task: str = ""
 
     # ------------------------------------------------------------------
     # Override the ReAct loop with the parallel orchestration loop.
@@ -277,6 +299,9 @@ class ParallelCodeAgent(CodeAgent):
         graph = TaskGraph()
         state = _PlanningState()
         self._visible_steps_by_task = {}
+        # Stash the user task so ``_build_worker_spec`` can include
+        # it verbatim in every sub-agent's prompt as context.
+        self._current_user_task = task
 
         with ParallelScheduler(
             build_spec=lambda t, g: self._build_worker_spec(t, g),
@@ -788,6 +813,7 @@ class ParallelCodeAgent(CodeAgent):
             task_goal=task.goal,
             task_dependencies=list(task.dependencies),
             dependency_results=dependency_results,
+            user_task=getattr(self, "_current_user_task", "") or "",
             model=self.model,
             tools=[t for t in self.tools.values() if t.name != "final_answer"] + [self.tools["final_answer"]],
             additional_authorized_imports=list(self.additional_authorized_imports),
