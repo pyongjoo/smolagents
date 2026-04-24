@@ -1,1230 +1,768 @@
-# Async Execution Design for Smolagents
+# Async / Parallel LLM Execution Design for smolagents
 
-## Overview
+## 1. Motivation
 
-This document describes the design and implementation plan for adding asynchronous execution capabilities to the smolagents CodeAgent. This feature enables the LLM's thought and code generation to proceed while the previous step's code is still executing.
+The current smolagents framework executes agents in a strictly sequential
+Thought → Code → Observation loop. Every step blocks on a single LLM call,
+followed by a single Python execution. This is simple and correct, but
+leaves significant time on the table when a task naturally decomposes into
+independent sub-tasks (e.g. fetching multiple web pages, running multiple
+searches, analyzing several files, etc.).
 
-**Key Constraint:** Executions are sequential - only one code execution runs at a time. However, while code is executing in the background, the LLM can proceed with generating thoughts and code for subsequent steps.
+This design introduces an **opt-in parallel execution mode** that:
 
-## Motivation
+- Lets a *planning* LLM call decompose work into a DAG of tasks, where
+  each task is described only by a **high-level goal** — not by concrete
+  code or tool calls.
+- Runs independent tasks concurrently in separate processes. Each task
+  internally runs its **own Thought → Code → Observation ReAct loop**
+  (with its own LLM calls) to elaborate the steps needed to achieve its
+  goal, exactly like today's `CodeAgent` does for a full run.
+- Re-invokes planning incrementally as tasks complete, based on
+  hints produced by the previous planning call.
+- Keeps the existing sequential loop fully intact when the flag is off.
 
-**Current Limitation:** Steps execute sequentially in a completely blocking manner:
+There are therefore **two levels of LLM calls**:
+
+1. **Planner-level** calls — coarse, infrequent, operate on the task
+   graph, produce new task *goals*.
+2. **Task-level** calls — fine-grained, one per ReAct step inside a
+   running task, produce concrete code to execute.
+
+The planner never writes code or prescribes tool sequences; that job
+belongs to the task-level LLM.
+
+Several pieces are **explicitly out of scope** for this first iteration
+and tracked in §14:
+
+- **Resource conflict detection.** Tasks declare the resources they
+  *expect* to modify, but the scheduler does not yet enforce mutual
+  exclusion.
+- **Progress reporting.** Only task-lifecycle events
+  (scheduled / started / completed) are emitted; mid-task progress is
+  not streamed live.
+- **Failure handling.** The first task failure raises
+  `AgentExecutionError`; there is no retry, cascading cancellation, or
+  failure-driven replanning yet.
+
+These are deferred deliberately so the initial slice stays small and
+reviewable.
+
+## 2. Design Principles
+
+1. **Additive, not invasive.** The new mechanism lives in new modules and
+   new classes; existing `MultiStepAgent`, `CodeAgent`, and
+   `ToolCallingAgent` code paths are untouched unless the new flag is set.
+2. **Flag-gated.** A single constructor flag (e.g.
+   `parallel_execution=True`) or a new `run(..., parallel=True)` kwarg
+   selects the parallel path. Default behavior is unchanged.
+3. **Incremental planning.** There is no distinction between "initial"
+   and "update" planning. The first call simply runs against an empty
+   task graph. Planning is always incremental: it may add new tasks,
+   but never mutates completed ones.
+4. **Graph-structured state.** A standalone module owns the task graph;
+   agents, planners, and executors interact with it through a narrow API.
+5. **Reuse existing memory.** Completed tasks produce standard
+   `ActionStep` entries that append to `AgentMemory`, so downstream
+   tooling (replay, monitoring, serialization) keeps working.
+6. **Goals, not scripts.** Planning output specifies *what* each task
+   should accomplish, never *how*. A task's internal ReAct loop is
+   responsible for figuring out the concrete thoughts, code, and tool
+   calls required to meet its goal.
+
+## 3. High-Level Architecture
+
 ```
-Step 1: Thought → Code → Execute → Observe (blocks here)
-Step 2: Thought → Code → Execute → Observe (blocks here)
-Step 3: ...
-```
-
-**With Async Execution:** LLM thinking/coding overlaps with execution:
-```
-Step 1: Thought → Code → Execute (execution running in background)
-              ↓ (LLM doesn't block)
-Step 2: Thought → Code → [Queued - waiting for Step 1 execution to finish]
-Step 1: Execution completes → Observation available
-Step 2: Execute (now runs)
-              ↓ (LLM doesn't block)
-Step 3: Thought → Code → [Queued - waiting for Step 2 execution to finish]
-...
-```
-
-**Key Insight:** While code executes (often I/O bound operations like API calls, file operations), the LLM can be thinking about and generating code for the next step. This overlapping reduces total wall-clock time.
-
-**Benefits:**
-- Faster task completion by overlapping LLM time with execution time
-- Better resource utilization (LLM + executor both working)
-- More natural pipelining of work
-- Simpler than full parallelism: only one execution at a time means no state conflicts
-
-## Core Architecture
-
-### Three-Phase Step Execution
-
-Each step is broken into three distinct phases:
-
-1. **Phase 1: Thought Generation** (streaming, yields immediately)
-   - LLM generates reasoning about what to do next
-   - Streams character-by-character via model.generate_stream()
-   - Stops at code block opening tag
-   - Yields: `ThoughtStreamDelta` events, then `ThoughtComplete`
-
-2. **Phase 2: Code Generation** (streaming, yields immediately)
-   - LLM continues generating the code block
-   - Streams character-by-character
-   - Stops at code block closing tag
-   - Yields: `CodeStreamDelta` events, then `CodeComplete`
-
-3. **Phase 3: Code Execution** (non-blocking, process-based)
-   - Code submitted to separate process for execution
-   - Returns immediately without waiting
-   - Yields: `ExecutionStarted` event
-   - Later yields: `ExecutionComplete` when done
-
-### Wait State Mechanism
-
-**Key Innovation:** The LLM has multiple strategies to handle the fact that the previous execution may still be running:
-
-**Strategy A: Explicit Wait Signal** (RECOMMENDED when you need results from previous step)
-1. LLM returns special marker in thought: `"no work to do"` or `"WAIT"`
-2. Central coordinator detects this marker
-3. Coordinator waits for the currently executing step to complete
-4. When execution completes, coordinator re-prompts LLM with results
-5. LLM can now proceed with new information
-
-**Strategy B: Queue Code for Later** (LIMITED - see Error Handling section)
-1. LLM generates code that will need results from previous step
-2. Code is queued and will execute after the current execution finishes
-3. ⚠️ LIMITATION: The code won't have access to variables from previous step due to process isolation
-4. Only works if previous step writes to external resources (files, databases)
-
-**Strategy C: Independent Work** (BEST when results not needed yet)
-1. LLM recognizes the previous execution is running
-2. Generates code for work that doesn't depend on previous results
-3. This code can execute immediately after current execution finishes
-4. Maximizes pipeline efficiency
-
-**Example Flow (Strategy A - Explicit Wait):**
-```
-Step 1: "Fetch data from API" → Code → Executing in background
-Step 2: "Process the fetched data" → LLM thinks: "I need data from Step 1"
-        → Returns: "no work to do: waiting for Step 1 to complete"
-Coordinator: Detects wait state → Blocks until Step 1 execution completes
-Step 1: Completes → Observation available
-Coordinator: Re-prompts LLM with Step 1 results
-Step 2: "Now I can process data" → Code → Execute (now runs)
+                          ┌──────────────────────┐
+                          │  ParallelCodeAgent   │
+                          │   (new subclass)     │
+                          └──────────┬───────────┘
+                                     │ owns
+            ┌────────────────────────┼─────────────────────────┐
+            ▼                        ▼                         ▼
+     ┌─────────────┐          ┌──────────────┐          ┌──────────────┐
+     │ TaskGraph   │◀────────▶│   Planner    │          │  Scheduler   │
+     │  (state)    │          │ (LLM calls)  │          │ (ProcessPool)│
+     └─────────────┘          └──────────────┘          └──────┬───────┘
+            ▲                                                  │
+            │                   results / failures             │
+            └──────────────────────────────────────────────────┘
 ```
 
-**Example Flow (Strategy C - Independent Work):**
+- **TaskGraph** – owns the DAG of pending / running / completed / failed
+  tasks. Produces a YAML view for prompting.
+- **Planner** – wraps the planning LLM call. Consumes `AgentMemory` +
+  `TaskGraph` and returns new tasks + a trigger describing when to be
+  called again.
+- **Scheduler** – maintains a process pool, decides which ready tasks to
+  launch, collects results, and writes them back into the `TaskGraph`
+  and `AgentMemory`.
+- **ParallelCodeAgent** – thin subclass of `CodeAgent` that orchestrates
+  the three pieces above when the parallel flag is on.
+
+### 3.1 Two-Level LLM Model
+
+It is important to keep the two levels distinct:
+
 ```
-Step 1: "Fetch user data from API" → Code → Executing in background
-Step 2: LLM thinks: "Step 1 is fetching data. I can prepare analysis config independently"
-        → Generates code: "config = {'method': 'stats', 'metrics': ['mean', 'std']}"
-        → Code queued (will run after Step 1)
-Step 1: Completes → Observation available
-Step 2: Code executes (config setup)
-Step 3: LLM thinks: "Now I have both user data and config"
-        → Generates code: "analyze(user_data, config)"
-        → Code queued
-Step 2: Completes → config available
-Step 3: Code executes (analysis runs)
+ Planner LLM (coarse, infrequent)
+ └─ produces Task(goal="Summarize paper A", deps=[...], ...)
+     │
+     ▼
+ Task execution (one process per task)
+   └─ Inner CodeAgent ReAct loop:
+        Thought  ──▶  Code  ──▶  Observation   (Task-level LLM call, step 1)
+        Thought  ──▶  Code  ──▶  Observation   (Task-level LLM call, step 2)
+        ...
+        final_answer(...)  ──▶  result bubbles up to the graph
 ```
 
-**Important:** Since only one execution runs at a time, there are no state conflicts. Each execution has exclusive access to modify state.
+- The planner **never** emits code, tool-call sequences, or inner-step
+  plans. Its output is purely a list of goals, dependencies, estimated
+  runtimes, and declarative resources.
+- Each task is itself a miniature `CodeAgent`: it runs a bounded
+  Thought → Code → Observation loop to *work out* how to meet its goal.
+  Every iteration of that loop makes its own LLM call — these are the
+  calls that actually run in parallel across the process pool.
+- When a task finishes, its inner `ActionStep`s are merged back into the
+  outer `AgentMemory` under a wrapping `ParallelTaskStep`, so the full
+  thought/code/observation trace is preserved and visible to the next
+  planner call (in summarized form).
 
-## Component Design
+This separation of concerns is what lets planning stay cheap and
+globally-aware while still letting each task reason flexibly about its
+own execution.
 
-### 1. AsyncStepManager (`async_execution.py`)
+## 4. New Files
 
-**Purpose:** Orchestrates sequential step execution using a single process
+To respect the "new file over in-place update" preference, all non-trivial
+new logic lives in dedicated modules:
 
-**Key Responsibilities:**
-- Submit code to a separate process for execution
-- Track the currently executing step (only one at a time)
-- Check if execution is complete
-- Manage state snapshots and merging
-- Maintain queue of pending code to execute
-- Handle process lifecycle
+| File | Purpose |
+| --- | --- |
+| `src/smolagents/parallel/__init__.py` | Public re-exports. |
+| `src/smolagents/parallel/task_graph.py` | `Task`, `TaskStatus`, `TaskGraph`. |
+| `src/smolagents/parallel/planner.py` | `ParallelPlanner` wrapping the LLM planning call. |
+| `src/smolagents/parallel/scheduler.py` | `ParallelScheduler` using `ProcessPoolExecutor`. |
+| `src/smolagents/parallel/events.py` | Event dataclasses for progress reporting. |
+| `src/smolagents/parallel/agent.py` | `ParallelCodeAgent` (and optionally `ParallelToolCallingAgent`). |
+| `src/smolagents/prompts/parallel_planning.yaml` | Planning prompt with examples. |
+| `tests/parallel/test_task_graph.py` | Unit tests for the graph. |
+| `tests/parallel/test_planner.py` | Tests with a mock model. |
+| `tests/parallel/test_scheduler.py` | Tests with fake tasks. |
+| `tests/parallel/test_parallel_agent.py` | End-to-end tests with a mock model. |
 
-**Main Methods:**
+## 5. Touch-Points in Existing Code
+
+Kept deliberately minimal:
+
+1. `src/smolagents/__init__.py` – re-export `ParallelCodeAgent` and the
+   parallel submodule.
+2. `src/smolagents/memory.py` – add two small dataclasses for task-level
+   memory entries (see §8). No changes to existing classes.
+3. `src/smolagents/agents.py` – *optional*, only to expose a
+   `parallel_execution` kwarg on `CodeAgent` that dispatches to
+   `ParallelCodeAgent`. If we prefer zero changes here, users import
+   `ParallelCodeAgent` directly.
+
+Everything else (ReAct loop, python executor, tools, prompt templates for
+the classical agent) is untouched.
+
+## 6. Task Graph Module
+
+### 6.1 Data Model
+
 ```python
-submit_code_execution(code, step_number, state_snapshot, tools) -> Future
-register_inflight_step(step_number, thought, code, future)
-get_current_execution() -> AsyncStepState | None
-is_execution_complete() -> bool
-get_completed_execution() -> tuple[step_number, output, logs, state_changes] | None
-wait_for_completion() -> tuple[step_number, output, logs, state_changes]
-has_pending_execution() -> bool
-shutdown()
+class TaskStatus(str, Enum):
+    PENDING   = "pending"     # Not yet runnable (deps unmet) or waiting in queue
+    READY     = "ready"       # Dependencies satisfied, not yet scheduled
+    RUNNING   = "running"
+    COMPLETED = "completed"
+    FAILED    = "failed"      # Populated only to surface the terminal error
+
+@dataclass
+class Task:
+    id: str                                 # unique within a run, e.g. "task_3"
+    goal: str                               # natural language description
+    dependencies: list[str]                 # parent task ids
+    expected_runtime_s: float | None        # LLM estimate
+    resources: list[str]                    # declarative only, not enforced yet
+    status: TaskStatus = TaskStatus.PENDING
+    result: Any | None = None
+    error: str | None = None
+    created_at: float = ...
+    started_at: float | None = None
+    finished_at: float | None = None
+    memory_step: ActionStep | None = None   # populated on completion
 ```
 
-**AsyncStepState Data Structure:**
+`CANCELLED` and a `progress` field are intentionally omitted — they
+will be added together with failure handling and progress reporting
+(§14).
+
+### 6.2 `TaskGraph` API
+
+```python
+class TaskGraph:
+    def add_tasks(self, tasks: Iterable[Task]) -> None
+    def get(self, task_id: str) -> Task
+    def ready_tasks(self) -> list[Task]              # deps completed, status==PENDING/READY
+    def running_tasks(self) -> list[Task]
+    def pending_tasks(self) -> list[Task]            # not yet ready (deps unmet)
+    def completed_tasks(self) -> list[Task]
+    def failed_tasks(self) -> list[Task]
+    def is_done(self) -> bool                        # no pending/ready/running left
+    def mark_running(self, task_id: str) -> None
+    def mark_completed(self, task_id: str, result, memory_step) -> None
+    def mark_failed(self, task_id: str, error: str) -> None
+    def to_yaml(self) -> str                         # full snapshot for prompts
+```
+
+`mark_failed` exists so a terminal error can be recorded on the graph
+for logging, but in this iteration the outer agent raises immediately
+on the first failure and does not attempt to make further progress.
+
+Invariants:
+
+- Task ids are unique and never reused.
+- Dependencies must point to tasks already in the graph.
+- Completed tasks are immutable.
+- Status transitions only along the state machine:
+  `PENDING → READY → RUNNING → {COMPLETED | FAILED}`.
+
+### 6.3 YAML Snapshot Format
+
+This is the canonical shape fed back to the planner and used in logs:
+
+```yaml
+tasks:
+  - id: task_1
+    goal: Search the web for recent papers on X.
+    status: completed
+    dependencies: []
+    expected_runtime_s: 15
+    actual_runtime_s: 12.4
+    resources: []
+    result_summary: "Found 5 papers, ids stored in `papers_list`."
+  - id: task_2
+    goal: Download PDF for each paper in `papers_list`.
+    status: running
+    dependencies: [task_1]
+    expected_runtime_s: 40
+    resources: ["./downloads/"]
+  - id: task_3
+    goal: Summarize each downloaded paper.
+    status: pending
+    dependencies: [task_2]
+    expected_runtime_s: 60
+    resources: []
+```
+
+Only small, plan-relevant fields are serialized; raw tool outputs stay in
+memory but aren't shipped back to the planner by default.
+
+## 7. Planner Module
+
+### 7.1 Responsibility
+
+A single method, `plan()`, performs one incremental planning LLM call.
+
+**The planner's only output is task *goals*, not task *implementations*.**
+Each goal is a natural-language description of what the task should
+achieve. The concrete Thought → Code → Observation steps required to
+meet that goal are decided at task execution time by the task's own
+inner ReAct loop (see §9.2), which makes its own LLM calls. The planner
+must not embed code, tool names, or step-by-step instructions in a
+task's `goal` field.
+
+```python
+class ParallelPlanner:
+    def __init__(self, model, prompt_templates, logger): ...
+
+    def plan(
+        self,
+        task: str,
+        memory: AgentMemory,
+        graph: TaskGraph,
+    ) -> PlanningResult: ...
+```
+
+`PlanningResult` is:
+
 ```python
 @dataclass
-class AsyncStepState:
-    step_number: int
-    status: "executing" | "completed" | "failed"
-    thought: str
-    code: str
-    started_at: float
-    completed_at: float | None
-    execution_future: Future | None
-    result: tuple[output, logs, state_changes] | None
-    error: Exception | None
-    elapsed_seconds: float  # computed property
+class PlanningResult:
+    new_tasks: list[Task]
+    next_trigger: NextPlanningTrigger
+    reasoning: str
+    raw_output: str
+    planning_step: PlanningStep   # for memory
+
+@dataclass
+class NextPlanningTrigger:
+    kind: Literal["after_task", "after_n_completions", "on_failure", "never"]
+    task_id: str | None = None
+    n: int | None = None
 ```
 
-### 2. Process-Based Code Execution
+There is no separate "initial" branch. The first call simply receives an
+empty `TaskGraph` and produces the initial tasks. Subsequent calls see the
+current graph (completed, running, pending) plus the updated memory and
+produce *additional* tasks (or none, if planning is done).
 
-**Why Processes (not threads):**
-- Complete isolation between executions
-- No GIL contention
-- Clean state management
-- No shared memory concerns
-- Safe for untrusted code
+Rules enforced in code:
 
-**Execution Function:**
-```python
-def _execute_code_in_process(
-    code: str,
-    state_snapshot: dict,
-    tools: dict,
-    authorized_imports: list[str],
-    max_print_outputs_length: int
-) -> tuple[output, logs, state_changes]:
-    # Runs in separate process
-    # Creates isolated LocalPythonExecutor
-    # Restores state from snapshot
-    # Executes code
-    # Returns results and state changes
-```
+- The planner must not reference task ids that don't already exist or
+  aren't being created in this call.
+- Dependencies of new tasks must be existing tasks (in any non-cancelled
+  state) or other new tasks from the same call.
+- If the LLM returns malformed YAML, we raise `AgentParsingError` and the
+  outer agent falls back to a single retry with a stricter "return YAML
+  only" reminder before giving up.
 
-**Process Pool Configuration:**
-- Uses `multiprocessing.ProcessPoolExecutor`
-- Context: `spawn` (cleanest isolation)
-- Max workers: **1** (only one execution at a time)
+### 7.2 Prompt Template
 
-### 3. Modified CodeAgent (`agents.py`)
+Location: `src/smolagents/prompts/parallel_planning.yaml`.
 
-**New Initialization Parameters:**
-```python
-enable_async_execution: bool = False  # Enable async mode
-```
+Must include **worked examples**, per the user's request. Sketch:
 
-**Key Methods:**
-
-#### `_run_stream_async()`
-Main async orchestration loop:
-```python
-def _run_stream_async(self, task, max_steps, images):
-    async_manager = AsyncStepManager()  # Single worker
-    
-    while not returned_final_answer and self.step_number <= max_steps:
-        # Check if previous execution is still running
-        current_execution = async_manager.get_current_execution()
-        
-        # Check if previous execution completed
-        if async_manager.is_execution_complete():
-            step_num, output, logs, state_changes = async_manager.get_completed_execution()
-            # Merge state changes
-            self.python_executor.merge_state_changes(state_changes, step_num)
-            # Yield completion event
-            yield ExecutionComplete(step_num, output, logs, state_changes)
-            # Add to memory
-            memory.add_observation(step_num, output, logs)
-        
-        # Generate next step (thought + code)
-        wait_detected = False
-        for output in self._step_stream_async(action_step, async_manager, current_execution):
-            yield output
-            
-            # Check for wait state
-            if isinstance(output, ThoughtComplete):
-                if self._is_wait_state(output.content):
-                    wait_detected = True
-                    break
-        
-        # If wait state detected, block until current execution completes
-        if wait_detected:
-            self.logger.log("Agent is waiting for execution to complete...")
-            step_num, output, logs, state_changes = async_manager.wait_for_completion()
-            self.python_executor.merge_state_changes(state_changes, step_num)
-            yield ExecutionComplete(step_num, output, logs, state_changes)
-            memory.add_observation(step_num, output, logs)
-            # Continue loop without incrementing step_number
-            # This will re-prompt LLM with new context
-            continue
-        
-        self.step_number += 1
-    
-    # Wait for final execution if any
-    if async_manager.has_pending_execution():
-        step_num, output, logs, state_changes = async_manager.wait_for_completion()
-        self.python_executor.merge_state_changes(state_changes, step_num)
-        yield ExecutionComplete(step_num, output, logs, state_changes)
-    
-    async_manager.shutdown()
-```
-
-#### `_step_stream_async()`
-Three-phase step execution:
-```python
-def _step_stream_async(self, memory_step, async_manager, current_execution):
-    # Prepare messages with current execution context
-    input_messages = self._augment_messages_with_execution_context(
-        self.write_memory_to_messages(),
-        current_execution
-    )
-    
-    # Phase 1: Stream thought generation
-    thought_content = ""
-    for delta in self.model.generate_stream(
-        input_messages,
-        stop_sequences=[self.code_block_tags[0]]
-    ):
-        thought_content += delta.content
-        yield ThoughtStreamDelta(content=delta.content, step=self.step_number)
-    
-    yield ThoughtComplete(content=thought_content, step=self.step_number)
-    memory_step.thought = thought_content
-    
-    # Check if this is a wait state
-    if self._is_wait_state(thought_content):
-        return  # Don't generate code, just return
-    
-    # Phase 2: Stream code generation
-    code_content = ""
-    for delta in self.model.generate_stream(
-        input_messages,
-        stop_sequences=[self.code_block_tags[1]]
-    ):
-        code_content += delta.content
-        yield CodeStreamDelta(content=delta.content, step=self.step_number)
-    
-    code_action = parse_code_blobs(code_content, self.code_block_tags)
-    code_action = fix_final_answer_code(code_action)
-    
-    yield CodeComplete(content=code_action, step=self.step_number)
-    memory_step.code_action = code_action
-    
-    # Phase 3: Submit to background execution (will queue if previous still running)
-    execution_future = async_manager.submit_code_execution(
-        code=code_action,
-        step_number=self.step_number,
-        state_snapshot=self.python_executor.get_state_snapshot(),
-        tools={**self.tools, **self.managed_agents}
-    )
-    
-    async_manager.register_inflight_step(
-        step_number=self.step_number,
-        thought=thought_content,
-        code=code_action,
-        future=execution_future
-    )
-    
-    yield ExecutionStarted(
-        code=code_action,
-        step=self.step_number,
-        started_at=time.time()
-    )
-```
-
-#### `_is_wait_state()`
-Detect wait state from thought content:
-```python
-def _is_wait_state(self, thought: str) -> bool:
-    """Check if LLM indicated it needs to wait."""
-    thought_lower = thought.lower()
-    wait_markers = [
-        "no work to do",
-        "cannot proceed",
-        "waiting for",
-        "must wait",
-        "need to wait",
-        "[wait]",
-    ]
-    return any(marker in thought_lower for marker in wait_markers)
-```
-
-#### `_augment_messages_with_execution_context()`
-Add current execution information to prompt:
-```python
-def _augment_messages_with_execution_context(
-    self, 
-    messages: list[ChatMessage], 
-    current_execution: AsyncStepState | None
-) -> list[ChatMessage]:
-    """Inject current execution context into system prompt."""
-    if not current_execution:
-        return messages
-    
-    # Build execution context
-    execution_context = self._build_execution_context(current_execution)
-    
-    # Insert into system message
-    system_message = messages[0]
-    augmented_content = system_message.content + "\n\n" + execution_context
-    messages[0] = ChatMessage(
-        role=system_message.role,
-        content=augmented_content
-    )
-    
-    return messages
-```
-
-### 4. Prompt Template (`prompts/code_agent_async.yaml`)
-
-**New File:** Dedicated prompt template for async execution mode.
-
-**Key Sections:**
-
-#### System Prompt Modifications
 ```yaml
-system_prompt: |-
-  You are an expert assistant who can solve any task using code blobs.
-  
-  **IMPORTANT: ASYNC EXECUTION MODE**
-  You are operating in async mode where code execution happens in background.
-  **KEY CONSTRAINT:** Only ONE execution runs at a time (sequential execution).
-  However, while code executes, you can think and generate code for the next step.
-  
-  At each step, follow this protocol:
-  
-  1. **Check if previous execution is still running** (see "Current Execution" below)
-  
-  2. **Decide your strategy:**
-  
-     **Option A - Explicit Wait (RECOMMENDED when you need previous results):**
-     - Write: "Thought: no work to do - waiting for Step X to complete"
-     - DO NOT write any code block
-     - The system will wait for Step X and re-prompt you
-     - Use this when you need variables created by the previous step
-     
-     **Option B - Queue Independent Code:**
-     - Write normal thought explaining your approach
-     - Generate code for work that doesn't depend on previous execution
-     - Your code will execute after the current execution finishes
-     - ⚠️  CANNOT access variables from previous step (process isolation)
-     - Can work with: external resources, independent calculations
-     
-     **Option C - Queue Code That Assumes Completion:**
-     - Write thought explaining you're generating code for after current execution
-     - Generate code that will run after previous completes
-     - Only works if previous step writes to external resources (files, DBs)
-     - Include checks: `if os.path.exists(...)` for safety
-  
-  3. **Write your Thought:** explaining your reasoning and chosen strategy
-  
-  4. **Write your Code:** (unless using Option A explicit wait)
-  
-  {%- if current_execution %}
-  
-  ## Current Execution:
-  
-  The following operation is CURRENTLY RUNNING:
-  
-  ### Step {{current_execution.step_number}} (running for {{current_execution.elapsed_seconds | round(1)}}s):
-  
-  **Thought:** {{current_execution.thought | truncate(200)}}
-  
-  **Code executing:**
-  ```python
-  {{current_execution.code}}
+planning: |-
+  You are a planning assistant for a parallel agent runtime.
+  You are given:
+  - The user's overall task.
+  - The agent's memory so far (thought/code/observation history).
+  - The current task graph (completed, running, pending).
+
+  Your job is to propose *new* tasks that should be added to the graph.
+  You may propose zero tasks if nothing more is needed right now. You must
+  also say when you should be called again.
+
+  Rules:
+  1. Output valid YAML, and nothing else.
+  2. Each new task must have:
+     - id (unique, new)
+     - goal (concise but complete natural-language description of *what*
+       the task should accomplish — NEVER include code, tool names, or
+       step-by-step instructions; the task itself will figure that out
+       via its own Thought/Code/Observation loop)
+     - dependencies (list of existing or newly-proposed task ids; [] if none)
+     - expected_runtime_s (your best numeric guess, in seconds)
+     - resources (list of string identifiers for things this task will
+       read or modify, e.g. file paths, variable names; [] if none)
+  3. `next_planning` tells the runtime when to call you again:
+     - kind: after_task | after_n_completions | on_failure | never
+     - task_id (if kind == after_task)
+     - n (if kind == after_n_completions)
+
+  Prefer wide, independent subtasks when possible — tasks without
+  dependencies on each other can run in parallel. Keep each goal
+  focused enough that a single sub-agent can complete it within a
+  handful of Thought → Code → Observation iterations.
+
+  ---
+  ## Example 1 — Initial planning, empty graph
+
+  User task: "Summarize the top 3 news stories about AI today."
+
+  Current graph:
+  tasks: []
+
+  Output:
+  ```yaml
+  reasoning: |
+    I need to search for today's AI news, then for each of the top 3
+    stories fetch the article and summarize it. Fetching and summarizing
+    each story is independent, so they can run in parallel once the search
+    is done.
+  new_tasks:
+    - id: task_1
+      goal: Search the web for today's top AI news stories and return
+        the top 3 URLs.
+      dependencies: []
+      expected_runtime_s: 10
+      resources: []
+    - id: task_2
+      goal: Fetch and summarize the first URL from task_1.
+      dependencies: [task_1]
+      expected_runtime_s: 30
+      resources: []
+    - id: task_3
+      goal: Fetch and summarize the second URL from task_1.
+      dependencies: [task_1]
+      expected_runtime_s: 30
+      resources: []
+    - id: task_4
+      goal: Fetch and summarize the third URL from task_1.
+      dependencies: [task_1]
+      expected_runtime_s: 30
+      resources: []
+  next_planning:
+    kind: after_task
+    task_id: task_1
   ```
-  
-  **Status:** {{current_execution.status}}
-  
-  **Decision Guide:**
-  - **Strategy A - Explicit Wait:** Use if you need results from Step {{current_execution.step_number}}
-  - **Strategy B - Independent Code:** Use if your work doesn't depend on above
-  - **Strategy C - Queue Dependent Code:** Use if Step {{current_execution.step_number}} writes to files/DBs you can read
-  - ⚠️  Your code will run AFTER Step {{current_execution.step_number}} completes
-  - ⚠️  You CANNOT access variables from Step {{current_execution.step_number}} (process isolation)
-  
-  {%- else %}
-  
-  ## Current Execution:
-  None - the previous execution has completed. You can proceed freely.
-  
-  {%- endif %}
-  
-  [Rest of standard instructions...]
-  
-  **Rules for Async Mode:**
-  1. Always check "Current Execution" section
-  2. Remember: Only ONE execution runs at a time
-  3. Your generated code will queue and run after current execution finishes
-  4. Choose your strategy:
-     - Option A: "no work to do" ← USE THIS when you need previous results
-     - Option B: Generate independent code ← USE THIS to maximize pipeline efficiency
-     - Option C: Queue code assuming previous completes ← ONLY for external resources
-  5. ⚠️  Process isolation: You CANNOT check variables with `if 'var' in dir()`
-  6. Use unique variable names to avoid confusion
-  7. State merges after each execution completes
-  
-  Now Begin!
+
+  ---
+  ## Example 2 — Incremental planning, some tasks done
+
+  User task: same as above.
+
+  Current graph:
+  ```yaml
+  tasks:
+    - id: task_1
+      status: completed
+      result_summary: "URLs: [url_a, url_b, url_c]"
+    - id: task_2
+      status: running
+    - id: task_3
+      status: running
+    - id: task_4
+      status: running
+  ```
+
+  Output:
+  ```yaml
+  reasoning: |
+    Search succeeded; summarization tasks are running. Once all three
+    summaries are back I should produce a final combined answer.
+  new_tasks:
+    - id: task_5
+      goal: Combine the three summaries from task_2, task_3, task_4
+        into a single answer and call final_answer with it.
+      dependencies: [task_2, task_3, task_4]
+      expected_runtime_s: 15
+      resources: []
+  next_planning:
+    kind: never
+  ```
+
+  ---
+  Now produce your YAML for:
+
+  User task:
+  ```
+  {{task}}
+  ```
+
+  Agent memory (summary):
+  ```
+  {{memory_summary}}
+  ```
+
+  Current task graph:
+  ```yaml
+  {{graph_yaml}}
+  ```
 ```
 
-#### Planning Modifications
-```yaml
-planning:
-  initial_plan: |-
-    [Standard planning prompt...]
-    
-    **Additional requirement for async mode:**
-    In your plan, consider that executions run sequentially but LLM thinking can overlap.
-    Identify which steps can have their code generated while a previous step executes.
-```
+All `{{...}}` slots are populated by the existing Jinja2 renderer.
 
-### 5. State Management (`local_python_executor.py`)
+## 8. Memory Integration
 
-**New Methods:**
+Two new memory step dataclasses in `memory.py`:
 
-#### `get_state_snapshot()`
 ```python
-def get_state_snapshot(self) -> dict:
-    """
-    Create serializable snapshot of current state.
-    This will be passed to separate process.
-    
-    Filters out:
-    - Non-picklable objects (with warning)
-    - Internal variables (starting with _)
-    - Tool instances (will be re-sent separately)
-    """
-    import copy
-    snapshot = {}
-    
-    for key, value in self.state.items():
-        # Skip internal variables
-        if key.startswith('_') and key != '_print_outputs':
-            continue
-            
-        try:
-            # Test if picklable
-            snapshot[key] = copy.deepcopy(value)
-        except Exception as e:
-            self.logger.log(
-                f"Cannot snapshot variable '{key}' (type: {type(value).__name__}): {e}",
-                level=LogLevel.DEBUG
-            )
-    
-    return snapshot
+@dataclass
+class ParallelPlanningStep(PlanningStep):
+    graph_snapshot_yaml: str
+    new_task_ids: list[str]
+    next_trigger: dict
+
+@dataclass
+class ParallelTaskStep(ActionStep):
+    task_id: str
+    task_goal: str
+    dependencies: list[str]
+    expected_runtime_s: float | None
+    resources: list[str]
 ```
 
-#### `merge_state_changes()`
+`ParallelTaskStep` inherits all ActionStep fields (code, observation,
+token usage, etc.), so it plugs straight into `AgentMemory.steps` without
+breaking any existing consumers. Replay and serialization just work.
+
+## 9. Scheduler Module
+
+### 9.1 Responsibilities
+
+- Keep a `ProcessPoolExecutor` with configurable `max_workers`.
+- On each tick:
+  1. Ask the graph for ready tasks.
+  2. Launch up to `max_workers` of them, moving them to `RUNNING`.
+  3. Poll futures; for each that has finished, update the graph and
+     emit events.
+- Provide a blocking `wait_for_next_event(timeout)` for the agent loop.
+
+In this first iteration the scheduler emits only three lifecycle
+events per task — `TaskScheduledEvent`, `TaskStartedEvent`, and
+`TaskCompletedEvent` — and does **not** report mid-task progress or
+handle failures gracefully. See §9.3 and §9.4 for what is deferred
+and why.
+
+### 9.2 Running a Task
+
+Each task runs in a worker process as a **mini CodeAgent that executes
+its own bounded Thought → Code → Observation loop**. This is where
+task-level LLM calls happen: every ReAct iteration inside the worker
+makes one LLM call, and because workers run in parallel across the
+process pool, these task-level calls run concurrently.
+
+Concretely, the worker is configured with:
+
+- A fresh `LocalPythonExecutor` seeded with:
+  - The parent agent's tools and managed agents.
+  - A read-only snapshot of the parent's Python state.
+  - The results of this task's completed dependencies, bound to
+    variables named after the dependency task ids (e.g. `task_1`).
+- A prompt constructed from:
+  - The system prompt of the parent agent (so the inner loop knows the
+    available tools and code conventions).
+  - A short prefix: "You are executing sub-task `{id}`. Goal: …",
+    carrying only the planner's high-level goal — no concrete steps.
+  - The parent memory (summary_mode, so lightweight).
+- `max_steps` bounded, typically much lower than the outer agent's cap
+  (tasks are expected to be focused, so a handful of ReAct iterations
+  should suffice).
+
+The worker terminates when either `final_answer(...)` is called inside
+the loop or `max_steps` is reached. It then returns a `TaskResult`
+containing:
+
+- Final answer / return value (what `final_answer` was called with, or
+  the last expression value).
+- The full list of captured inner `ActionStep`s, serialized for
+  cross-process transport. These get wrapped into a `ParallelTaskStep`
+  (see §8) when merged back into the outer `AgentMemory`, so the
+  planner on subsequent rounds can see a summary of *how* the task
+  was solved, not just its final answer.
+- Logs and observations (truncated).
+- Token usage (task-level tokens; tracked separately from planner
+  tokens for observability).
+
+### 9.3 Progress Reporting (Deferred)
+
+**Deferred to a future iteration.** For now, the scheduler only reports
+*lifecycle* events — when a task is scheduled, started, and completed —
+but does not surface mid-task progress. The worker's inner ReAct steps
+are captured and returned in `TaskResult` on completion, so the full
+trace is still available after the fact; it is just not streamed live.
+
+Events present in this iteration live in `parallel/events.py`:
+
 ```python
-def merge_state_changes(
-    self,
-    state_changes: dict,
-    step_number: int,
-    conflict_strategy: Literal["error", "overwrite", "skip"] = "error"
-) -> dict[str, str]:
-    """
-    Merge state changes from completed async execution.
-    
-    Detects conflicts: variables modified both locally and by async step.
-    
-    Args:
-        state_changes: New/modified variables from async execution
-        step_number: Which step produced these changes
-        conflict_strategy: How to handle conflicts
-            - "error": Raise exception on conflict
-            - "overwrite": Remote changes win
-            - "skip": Local changes win
-    
-    Returns:
-        Dictionary of detected conflicts (empty if none)
-    """
-    conflicts = {}
-    
-    for key, new_value in state_changes.items():
-        if key == "_print_outputs":
-            # Special handling: append print outputs
-            if key in self.state:
-                self.state[key] += "\n" + new_value
-            else:
-                self.state[key] = new_value
-            continue
-        
-        if key in self.state:
-            old_value = self.state[key]
-            # Simple equality check for conflict detection
-            # More sophisticated: hash-based or deep comparison
-            if old_value != new_value:
-                conflict_msg = (
-                    f"Variable '{key}' was modified both locally and by Step {step_number}. "
-                    f"Local: {type(old_value).__name__}, Remote: {type(new_value).__name__}"
-                )
-                conflicts[key] = conflict_msg
-                
-                if conflict_strategy == "error":
-                    raise AsyncConflictError(conflict_msg)
-                elif conflict_strategy == "skip":
-                    self.logger.log(f"Conflict on '{key}': keeping local value", LogLevel.WARNING)
-                    continue
-                # else: overwrite (fall through)
-        
-        self.state[key] = new_value
-    
-    if conflicts and conflict_strategy != "error":
-        self.logger.log(
-            f"Resolved {len(conflicts)} conflicts using strategy: {conflict_strategy}",
-            LogLevel.WARNING
+@dataclass
+class TaskScheduledEvent:    task: Task
+@dataclass
+class TaskStartedEvent:      task: Task
+@dataclass
+class TaskCompletedEvent:    task: Task
+@dataclass
+class PlanningTriggeredEvent: trigger: NextPlanningTrigger
+```
+
+These extend the existing `StreamEvent` union so streaming consumers
+can pattern-match on them. `TaskProgressEvent`, `TaskFailedEvent`, and
+`TaskCancelledEvent` will be added when progress reporting and failure
+handling land (see §14).
+
+### 9.4 Failure Handling (Deferred)
+
+**Deferred to a future iteration.** In this first cut the behaviour on
+any task failure is deliberately minimal:
+
+1. If a task raises, or its worker process crashes, the scheduler
+   records the exception on the `Task` (status stays conceptually
+   "failed" for logs) and stops submitting new work.
+2. Any dependent tasks simply never become ready, so they remain
+   `PENDING` in the final graph snapshot.
+3. The outer `ParallelCodeAgent.run(...)` surfaces the first failure by
+   raising `AgentExecutionError`, matching how a failing step is
+   handled in the sequential agent today.
+
+Retry budgets, dependency-cascade cancellation, re-planning on failure,
+and crash-vs-exception differentiation are explicitly out of scope for
+now and tracked in §14. The planner prompt also does not need a
+failure-recovery example yet; it will be added when failure handling
+is introduced.
+
+## 10. Parallel Agent (`ParallelCodeAgent`)
+
+A subclass of `CodeAgent` that overrides `_run_stream`.
+
+```python
+class ParallelCodeAgent(CodeAgent):
+    def __init__(
+        self,
+        *args,
+        max_parallel_tasks: int = 4,
+        max_task_steps: int = 6,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.planner   = ParallelPlanner(self.model, self.prompt_templates, self.logger)
+        self.graph     = TaskGraph()
+        self.scheduler = ParallelScheduler(
+            max_workers=max_parallel_tasks,
+            build_worker=self._build_worker_spec,
         )
-    
-    return conflicts
+        ...
 ```
 
-### 6. Memory System (`memory.py`)
+Retry / failure-handling knobs are intentionally omitted here; they
+will be introduced together with failure handling (§14).
 
-**New Output Classes:**
+### 10.1 Execution Loop (replaces `_run_stream` under the flag)
+
+Pseudocode:
 
 ```python
-@dataclass
-class ThoughtStreamDelta(MemoryStep):
-    """Yielded during thought streaming"""
-    content: str
-    step: int
-    
-    def to_messages(self, summary_mode: bool = False) -> list[ChatMessage]:
-        return []
+def _run_stream(self, task, max_steps, images):
+    # Always start with one planning call against an empty graph.
+    yield from self._run_planning(task)
 
-@dataclass
-class ThoughtComplete(MemoryStep):
-    """Yielded when thought generation completes"""
-    content: str
-    step: int
-    is_wait_state: bool = False  # Flagged if this is a wait
-    
-    def to_messages(self, summary_mode: bool = False) -> list[ChatMessage]:
-        # Only include in messages if not a wait state
-        if self.is_wait_state:
-            return []
-        return [
-            ChatMessage(
-                role=MessageRole.ASSISTANT,
-                content=[{"type": "text", "text": f"Thought: {self.content}"}]
-            )
-        ]
+    while not self.graph.is_done():
+        # Launch whatever is ready.
+        for t in self.graph.ready_tasks():
+            self.scheduler.submit(t)
+            yield TaskScheduledEvent(t)
 
-@dataclass
-class CodeStreamDelta(MemoryStep):
-    """Yielded during code streaming"""
-    content: str
-    step: int
-    
-    def to_messages(self, summary_mode: bool = False) -> list[ChatMessage]:
-        return []
+        # Block until something happens (completion, failure, progress).
+        for event in self.scheduler.drain_events(timeout=...):
+            yield event
+            self._apply_event_to_graph(event)
 
-@dataclass
-class CodeComplete(MemoryStep):
-    """Yielded when code generation completes"""
-    content: str
-    step: int
-    
-    def to_messages(self, summary_mode: bool = False) -> list[ChatMessage]:
-        return []
+        # Decide whether to re-plan.
+        if self._should_replan():
+            yield from self._run_planning(task)
 
-@dataclass
-class ExecutionStarted(MemoryStep):
-    """Yielded when code execution starts (non-blocking)"""
-    code: str
-    step: int
-    started_at: float
-    
-    def to_messages(self, summary_mode: bool = False) -> list[ChatMessage]:
-        return []
-
-@dataclass
-class ExecutionComplete(MemoryStep):
-    """Yielded when background execution completes"""
-    step: int
-    output: Any
-    logs: str
-    state_changes: dict
-    elapsed_time: float
-    
-    def to_messages(self, summary_mode: bool = False) -> list[ChatMessage]:
-        observation_text = f"Observation from Step {self.step}:\n"
-        if self.logs:
-            observation_text += f"Execution logs:\n{self.logs}\n"
-        observation_text += f"Last output: {self.output}"
-        
-        return [
-            ChatMessage(
-                role=MessageRole.USER,
-                content=[{"type": "text", "text": observation_text}]
-            )
-        ]
+    # Derive final answer. Typical pattern: the planner creates a terminal
+    # task that calls `final_answer`. If none did, we fall back to a
+    # `provide_final_answer` LLM call, as today.
+    yield self._finalize(task)
 ```
 
-**Modified ActionStep:**
-```python
-@dataclass
-class ActionStep(MemoryStep):
-    step_number: int
-    timing: Timing
-    thought: str | None = None  # NEW: store thought separately
-    model_input_messages: list[ChatMessage] | None = None
-    tool_calls: list[ToolCall] | None = None
-    error: AgentError | None = None
-    model_output_message: ChatMessage | None = None
-    model_output: str | list[dict[str, Any]] | None = None
-    code_action: str | None = None
-    observations: str | None = None
-    observations_images: list["PIL.Image.Image"] | None = None
-    action_output: Any = None
-    token_usage: TokenUsage | None = None
-    is_final_answer: bool = False
-    is_wait_state: bool = False  # NEW: flag for wait states
-```
+### 10.2 `_should_replan`
 
-## Implementation Plan
+Returns True when any of the following holds:
 
-### Phase 1: Core Infrastructure
-**Files to create:**
-- `src/smolagents/async_execution.py`
-  - `AsyncStepState` dataclass
-  - `_execute_code_in_process()` function
-  - `AsyncStepManager` class
+- The most recent `NextPlanningTrigger` is satisfied (target task
+  completed, or `n` completions since last planning, etc.).
+- The graph has no ready or running tasks but `is_done()` is still
+  False (sanity guard: avoid deadlock — in practice this shouldn't
+  happen, but if it does, we re-plan instead of hanging).
 
-**Files to modify:**
-- `src/smolagents/utils.py`
-  - Add `AsyncConflictError` exception
+A failure-driven replan condition will be added alongside failure
+handling (§14).
 
-### Phase 2: Executor State Management
-**Files to modify:**
-- `src/smolagents/local_python_executor.py`
-  - Add `get_state_snapshot()` method
-  - Add `merge_state_changes()` method
-  - Update `__call__()` to support process execution
+### 10.3 Final Answer
 
-### Phase 3: Memory System
-**Files to modify:**
-- `src/smolagents/memory.py`
-  - Add new output dataclasses (ThoughtStreamDelta, etc.)
-  - Modify `ActionStep` to include `thought` and `is_wait_state`
-  - Update type aliases
+Two supported styles, both documented in the prompt examples:
 
-### Phase 4: Prompt Template
-**Files to create:**
-- `src/smolagents/prompts/code_agent_async.yaml`
-  - Complete async-aware prompt with wait state instructions
-  - Inflight steps context section
-  - Async-specific rules and examples
+1. The planner schedules a terminal aggregator task that calls
+   `final_answer(...)`. Its return value becomes the run's output.
+2. If no terminal task exists when the graph is done, the agent runs
+   the existing `provide_final_answer()` path over the enriched memory.
 
-### Phase 5: Agent Async Logic
-**Files to modify:**
-- `src/smolagents/agents.py`
-  - Update `CodeAgent.__init__()` with async parameters
-  - Add `_run_stream_async()` method
-  - Add `_step_stream_async()` method
-  - Add `_is_wait_state()` helper
-  - Add `_augment_messages_with_inflight_context()` helper
-  - Update `run()` to route to async when enabled
-
-### Phase 6: Testing & Validation
-**Files to create:**
-- `tests/test_async_execution.py`
-  - Test wait state detection
-  - Test state snapshot/merge
-  - Test sequential execution with pipeline overlap
-  - Test that only one execution runs at a time
-- `playground/async_agent_demo.py`
-  - Demonstration script
-
-## Usage Example
+## 11. Flag Surface
 
 ```python
-from smolagents import CodeAgent, LiteLLMModel
-
-model = LiteLLMModel(model_id="gpt-4")
-
-# Create agent with async execution enabled
-agent = CodeAgent(
-    tools=[],
+# Option A — explicit class
+from smolagents import ParallelCodeAgent
+agent = ParallelCodeAgent(
+    tools=[...],
     model=model,
-    enable_async_execution=True
+    max_parallel_tasks=4,
 )
+agent.run("…")
 
-# Run agent - LLM will generate thoughts/code while executions run
-result = agent.run(
-    "Fetch weather data for 3 cities and analyze the patterns",
-    stream=True
-)
-
-# Stream will yield:
-# - ThoughtStreamDelta events (as thought is generated)
-# - ThoughtComplete events (complete thought)
-# - CodeStreamDelta events (as code is generated)
-# - CodeComplete events (complete code)
-# - ExecutionStarted events (code submitted to background)
-# - ExecutionComplete events (when background execution finishes)
-# - ActionStep events (complete steps)
-# - FinalAnswerStep (final result)
-
-for event in result:
-    if isinstance(event, ThoughtComplete):
-        print(f"Thought: {event.content}")
-    elif isinstance(event, ExecutionStarted):
-        print(f"Started executing step {event.step}")
-    elif isinstance(event, ExecutionComplete):
-        print(f"Step {event.step} completed: {event.output}")
+# Option B — convenience flag on CodeAgent (thin dispatch)
+agent = CodeAgent(tools=[...], model=model, parallel_execution=True)
 ```
 
-## Behavior Examples
-
-### Example 1: Independent Steps (Sequential Execution with Pipeline Overlap)
-```
-User: "Calculate 100! and also compute fib(30)"
-
-Step 1:
-  Thought: "I'll calculate 100 factorial first"
-  Code: result_factorial = math.factorial(100)
-  → Submits to background process (starts executing)
-
-Step 2:
-  Checks: Step 1 execution still running
-  Thought: "Step 1 is calculating factorial. I can generate code for fibonacci now"
-  Code: result_fib = fibonacci(30)
-  → Queued (will execute after Step 1 completes)
-
-Step 1 execution completes → result_factorial available
-
-Step 2 execution starts → calculates fibonacci
-
-Step 2 execution completes → result_fib available
-
-Step 3:
-  Checks: No execution running
-  Thought: "Both results are now available, I can report them"
-  Code: final_answer(f"Factorial: {result_factorial}, Fib: {result_fib}")
-  → Executes
-
-Note: While Step 1 was executing, the LLM generated code for Step 2. This pipeline
-overlap saves the time it would take to generate Step 2's code after Step 1 finishes.
-```
-
-### Example 2: Dependent Steps (with Explicit Wait)
-```
-User: "Fetch user data from API, then calculate average age"
-
-Step 1:
-  Thought: "I'll fetch the user data"
-  Code: users = fetch_users_from_api()
-  → Submits to background process
-
-Step 2:
-  Checks: Step 1 still running
-  Thought: "I need the users data from Step 1 to calculate average age"
-  Thought: "no work to do - waiting for Step 1 to complete"
-  → No code generated
-
-Coordinator: Detects wait state → Blocks until Step 1 completes
-
-Step 1 completes → users data now available
-Coordinator: Re-prompts LLM with completed Step 1
-
-Step 2 (retry):
-  Checks: No running steps
-  Thought: "Step 1 is complete, users data is available. I can now calculate average"
-  Code: avg_age = sum(u['age'] for u in users) / len(users)
-        final_answer(f"Average age: {avg_age}")
-  → Executes
-```
-
-### Example 2B: Dependent Steps (with Code-Based Wait - External Resource)
-```
-User: "Fetch user data from API and save it, then calculate average age"
-
-Step 1:
-  Thought: "I'll fetch the user data and save to file for other steps"
-  Code: 
-    import json
-    users = fetch_users_from_api()
-    with open('/tmp/users.json', 'w') as f:
-        json.dump(users, f)
-    print("Users data saved to /tmp/users.json")
-  → Submits to background process
-
-Step 2:
-  Checks: Step 1 still running
-  Thought: "I need users data from Step 1. Since it's saved to file, I can poll for it"
-  Code: 
-    import time, os, json
-    
-    # Wait for file to appear
-    timeout = 30
-    elapsed = 0
-    while not os.path.exists('/tmp/users.json') and elapsed < timeout:
-        print(f"Waiting for users data file... ({elapsed}s)")
-        time.sleep(1)
-        elapsed += 1
-    
-    if not os.path.exists('/tmp/users.json'):
-        raise Exception("Timeout waiting for users data")
-    
-    # Load and calculate average age
-    with open('/tmp/users.json') as f:
-        users = json.load(f)
-    avg_age = sum(u['age'] for u in users) / len(users)
-    print(f"Average age: {avg_age}")
-    final_answer(f"Average age: {avg_age}")
-  → Submits to background process (will poll file system)
-
-Step 1 completes → writes /tmp/users.json
-Step 2's code detects file → loads and calculates average age
-
-Note: Strategy A (explicit wait) would be simpler for this case!
-```
-
-### Example 3: Mixed Strategies (Sequential Execution)
-```
-User: "Download file A, download file B, then merge them and analyze"
-
-Step 1:
-  Thought: "Download file A to /tmp/file_a.dat"
-  Code: 
-    file_a_data = download('url_a')
-    with open('/tmp/file_a.dat', 'wb') as f:
-        f.write(file_a_data)
-    print("Downloaded file A")
-  → Executing in background
-
-Step 2:
-  Checks: Step 1 execution running
-  Thought: "Step 1 downloading. I'll generate code for file B download (Strategy B - queue independent work)"
-  Code: 
-    file_b_data = download('url_b')
-    with open('/tmp/file_b.dat', 'wb') as f:
-        f.write(file_b_data)
-    print("Downloaded file B")
-  → Queued (will run after Step 1)
-
-Step 1: Completes → /tmp/file_a.dat available
-Step 2: Execution starts → downloading file B
-
-Step 3:
-  Checks: Step 2 execution running (downloading file B)
-  Thought: "Step 2 downloading B. I can generate merge code (Strategy C - queue dependent code)"
-  Code:
-    import time, os
-    
-    # Wait for both files (defensive check)
-    timeout = 60
-    start = time.time()
-    while (not os.path.exists('/tmp/file_a.dat') or 
-           not os.path.exists('/tmp/file_b.dat')) and \
-          (time.time() - start) < timeout:
-        time.sleep(1)
-    
-    if not os.path.exists('/tmp/file_a.dat') or \
-       not os.path.exists('/tmp/file_b.dat'):
-        raise Exception("Timeout waiting for files")
-    
-    # Load and merge
-    with open('/tmp/file_a.dat', 'rb') as f:
-        file_a_data = f.read()
-    with open('/tmp/file_b.dat', 'rb') as f:
-        file_b_data = f.read()
-    
-    merged = merge_files(file_a_data, file_b_data)
-    with open('/tmp/merged.dat', 'wb') as f:
-        f.write(merged)
-    print(f"Files merged: {len(merged)} bytes")
-  → Queued (will run after Step 2)
-
-Step 2: Completes → /tmp/file_b.dat available
-Step 3: Execution starts → merging files
-
-Step 4:
-  Checks: Step 3 execution running (merging)
-  Thought: "Step 3 merging. I can prepare analysis config (Strategy B - independent)"
-  Code: 
-    import json
-    config = {
-        'method': 'statistical',
-        'metrics': ['mean', 'median', 'std'],
-        'visualize': True
-    }
-    with open('/tmp/analysis_config.json', 'w') as f:
-        json.dump(config, f)
-    print("Analysis config ready")
-  → Queued (will run after Step 3)
-
-Step 3: Completes → /tmp/merged.dat available
-Step 4: Execution starts → config setup
-
-Step 4: Completes → /tmp/analysis_config.json available
-
-Step 5:
-  Checks: No execution running
-  Thought: "All inputs ready. I can analyze now"
-  Code:
-    import json
-    
-    with open('/tmp/analysis_config.json') as f:
-        config = json.load(f)
-    
-    with open('/tmp/merged.dat', 'rb') as f:
-        merged = f.read()
-    
-    results = analyze(merged, config)
-    final_answer(f"Analysis complete: {results}")
-  → Executes
-
-Note: While each execution ran sequentially, the LLM was generating code for
-subsequent steps during each execution, creating a pipeline effect.
-```
-
-## Error Handling
-
-### No State Conflicts (Sequential Execution Benefit!)
-
-```python
-# With sequential execution, this scenario CANNOT happen:
-Step 1: x = fetch_data_slow()  # Takes 10s
-Step 2: x = 42                  # Would run AFTER Step 1 completes
-
-# Step 2's code is queued and only executes after Step 1 finishes
-# Each execution has exclusive access to state
-# No conflicts possible!
-```
-
-**Benefit of Sequential Execution:**
-- No concurrent state modifications
-- No need for complex conflict resolution
-- Simpler state management
-- Predictable execution order
-
-### Code-Based Waiting Considerations
-
-**Process isolation still applies:**
-```python
-# Step 2 code runs in its own process AFTER Step 1
-# But it gets a state snapshot from AFTER Step 1 completed
-# So it WILL see variables created by Step 1!
-```
-
-**This works because execution is sequential:**
-When Step 2 starts executing:
-1. Step 1 has already completed
-2. Step 1's state changes are merged into main executor state
-3. Step 2 gets a fresh snapshot with Step 1's variables
-4. Step 2 can now access those variables
-
-**Revised Example 2B - This NOW works:**
-```python
-# Step 1 runs first
-users = fetch_users_from_api()
-
-# After Step 1 completes, Step 2 gets snapshot with 'users'
-# This check would work:
-if 'users' not in dir():
-    raise Exception("Users not found")
-
-avg_age = sum(u['age'] for u in users) / len(users)
-```
-
-However, **explicit wait (Strategy A) is still simpler** because:
-- Coordinator handles it automatically
-- No need for defensive checks
-- Clearer code intent
-
-### Process Failures
-```python
-# If execution process crashes
-Step 1: Execute code → Process dies
-
-async_manager.poll_completed() returns:
-  (step_num=1, output=None, logs="Process terminated", state_changes={})
-
-Agent: Handles error in memory, continues or retries
-```
-
-### Timeouts
-```python
-# If step takes too long
-Step 1: Execute infinite loop
-
-async_manager.wait_any(timeout=30.0)
-  → Raises TimeoutError after 30s
-
-Agent: Can cancel step, log error, continue
-```
-
-## Configuration
-
-### Agent Initialization
-```python
-agent = CodeAgent(
-    tools=tools,
-    model=model,
-    
-    # Async configuration
-    enable_async_execution=True,        # Enable async mode
-    
-    # Executor configuration (must be local for async)
-    executor_type="local",
-    
-    # Other standard parameters
-    max_steps=20,
-    verbosity_level=LogLevel.INFO,
-)
-```
-
-### Environment Variables
-```python
-# Optional: Control multiprocessing behavior
-os.environ['SMOLAGENTS_ASYNC_METHOD'] = 'spawn'  # or 'fork' (not recommended)
-os.environ['SMOLAGENTS_ASYNC_TIMEOUT'] = '60'    # Default timeout in seconds
-```
-
-## Limitations and Constraints
-
-### 1. Executor Compatibility
-- **Only works with `executor_type="local"`**
-- Remote executors (E2B, Modal, etc.) not supported initially
-- Reason: Need control over state management
-
-### 2. State Serialization
-- Only picklable objects can be passed between processes
-- File handles, network connections, etc. won't work
-- Tools must be serializable
-
-### 3. Managed Agents
-- Managed agents (sub-agents) may not work in async mode
-- Reason: Complex state management across processes
-
-### 4. Performance Overhead
-- Process creation has overhead (~100ms per process)
-- State serialization/deserialization cost
-- Best for long-running operations (>1 second)
-- **Sequential execution means no true parallelism** - benefit comes from pipeline overlap
-
-### 5. Determinism
-- Execution order is fully deterministic (sequential)
-- Results are predictable and reproducible
-- Much simpler than fully concurrent execution
-
-## Future Enhancements
-
-### 1. Smart Dependency Tracking
-- Automatically detect variable dependencies
-- Build dependency graph
-- Optimize execution order
-
-### 2. State Diffing
-- More sophisticated state tracking
-- Track which lines modified which variables
-- Better debugging of state changes
-
-### 3. Execution Prediction
-- Estimate execution time for steps
-- Better wait vs. proceed decisions
-- Optimize pipeline efficiency
-
-### 4. Remote Executor Support
-- Extend async support to E2B, Modal
-- Requires async-aware remote execution
-
-### 5. Checkpoint/Resume
-- Save state during long runs
-- Resume from checkpoints
-- Fault tolerance
-
-## Testing Strategy
-
-### Unit Tests
-- `AsyncStepManager` state tracking
-- State snapshot/merge logic
-- Wait state detection
-- Prompt augmentation
-
-### Integration Tests
-- End-to-end async execution
-- Sequential execution with pipeline overlap
-- Wait state handling
-- Error recovery
-
-### Performance Tests
-- Speedup measurement (vs sync)
-- Pipeline efficiency measurement
-- Overhead quantification
-
-### Stress Tests
-- Long execution chains
-- Large state sizes
-- Process failures
-- Timeout handling
-
-## Documentation Updates
-
-### User Guide
-- When to use async mode
-- How to write async-friendly tasks
-- Performance tuning tips
-- Debugging async execution
-
-### API Reference
-- New parameters documented
-- New output types explained
-- Examples for each feature
-
-### Migration Guide
-- Converting sync agents to async
-- Common pitfalls
-- Performance comparison
-
-## Open Questions
-
-1. **How to handle tool calls that modify global state?**
-   - With sequential execution, this is less of an issue
-   - But still relevant for external resources (files, databases)
-   - Possible solution: Tool-level awareness of resource usage
-
-2. **Should we support async for ToolCallingAgent too?**
-   - Similar architecture could apply
-   - Would also use sequential execution model
-   - Pipeline LLM reasoning with tool execution
-
-3. **How to visualize async execution for debugging?**
-   - Timeline view showing pipeline overlap
-   - Show when LLM is generating vs when execution is running
-   - State change visualization
-
-4. **Should wait state be explicit or implicit?**
-   - Current: Explicit "no work to do" marker
-   - Alternative: Analyze code for dependencies automatically
-   - Current approach gives LLM more control
-
-5. **Rate limiting for LLM calls?**
-   - Rapid re-prompting on wait states could hit rate limits
-   - Need backoff or throttling
-   - Possibly queue multiple generations during long executions
-
-## Conclusion
-
-This async execution design enables the CodeAgent to achieve overlapping of LLM reasoning/code generation with code execution. By separating thought generation, code generation, and code execution into distinct phases, and by enforcing sequential execution, we create a system that can pipeline work efficiently while maintaining simplicity and correctness.
-
-### The Sequential Execution Model:
-
-**Only one code execution runs at a time**, but the LLM can generate thoughts and code for subsequent steps while the current execution is running. This creates a pipeline effect:
-
-```
-Timeline:
-|--- Step 1: Thought+Code (LLM) ---|--- Step 1: Execute ---|
-                                    |--- Step 2: Thought+Code (LLM) ---|--- Step 2: Execute ---|
-                                                                        |--- Step 3: Thought+Code (LLM) ---|
-```
-
-### The Three Strategies:
-
-1. **Strategy A - Explicit Wait (RECOMMENDED)**: The LLM signals "no work to do" when it needs results from the running execution. The coordinator waits for completion and re-prompts with updated context. This is the simplest and most reliable approach.
-
-2. **Strategy B - Queue Independent Code**: The LLM generates code for work that doesn't depend on the current execution's results. This code queues and runs after the current execution finishes.
-
-3. **Strategy C - Queue Code Assuming Completion**: The LLM generates code that will run after the current execution, using external resources (files, DBs) for communication between steps.
-
-### Key Benefits of Sequential Execution:
-
-- **No state conflicts**: Only one execution modifies state at a time
-- **Deterministic**: Execution order is predictable and reproducible
-- **Simpler state management**: No complex merging or conflict resolution
-- **Process isolation still protects**: Each execution in its own process
-- **Pipeline efficiency**: LLM time overlaps with execution time
-
-### Important Characteristics:
-
-- **Process isolation ensures safety**: Each execution is completely isolated
-- **State merges after each execution**: Results become available for next step
-- **Variables ARE accessible**: Since execution is sequential, Step N+1 sees Step N's variables
-- **Best for I/O-bound operations**: While waiting for API calls, file I/O, the LLM is thinking
-
-### Trade-offs:
-
-- **No true parallelism**: Independent operations still run sequentially
-- **Benefit is pipeline overlap**: Time saved = LLM generation time during execution
-- **Best when LLM time ≈ execution time**: Maximum pipeline efficiency
-- **Less benefit if execution is instant**: Overhead may not be worth it
-
-Implementation will be done incrementally, with careful testing at each phase. The design prioritizes **correctness, simplicity, and safety** while enabling meaningful pipeline efficiency for appropriate tasks.
+Both are trivial to support; Option B just instantiates the parallel
+subclass under the hood when the flag is True. Default remains `False`,
+so no existing user is affected.
+
+## 12. Observability
+
+- The lifecycle event types in §9.3 are streamable; existing
+  `stream=True` users get them for free.
+- `TaskGraph.to_yaml()` is logged at `LogLevel.DEBUG` after every
+  planning call and at `INFO` on completion.
+- `Monitor` is extended with a minimal parallel counter
+  (`tasks_completed`). Richer metrics — failure rates, predicted-vs-
+  actual runtime ratios, etc. — are deferred along with progress
+  reporting and failure handling.
+
+## 13. Testing Strategy
+
+- **Unit:** TaskGraph state machine, YAML round-trip, trigger
+  evaluation.
+- **Planner:** use `InferenceClientModel` mocks that return canned YAML;
+  assert that new tasks are merged, invalid YAML triggers the retry,
+  dependency validation rejects bad ids.
+- **Scheduler:** run fake tasks (pure Python callables) to verify
+  parallelism and basic lifecycle events — no LLM involved.
+- **End-to-end:** mock model that returns scripted planning YAML and
+  scripted code for a toy multi-fetch task; assert that
+  `ParallelCodeAgent.run(...)` completes with the expected final answer
+  on the happy path and that task timings indicate actual parallelism.
+
+Failure-path and progress-event tests will be added together with the
+corresponding features (§14).
+
+## 14. Out of Scope (for now)
+
+- **Progress reporting.** Only task-lifecycle events are streamed in
+  this iteration; mid-task progress updates from the worker's inner
+  ReAct loop are not forwarded. A follow-up will add a
+  `multiprocessing.Queue`-backed pipeline, a `TaskProgressEvent`, and
+  `Task.progress` updates on the graph.
+- **Failure handling.** The current design fails fast: on the first
+  task exception or worker crash, the run raises
+  `AgentExecutionError`. A follow-up will add retry budgets,
+  dependency-cascade cancellation (`TaskStatus.CANCELLED`,
+  `graph.cancel_descendants`), re-plan-on-failure, a
+  `max_total_failures` global budget, and dedicated
+  `TaskFailedEvent` / `TaskCancelledEvent` events. The planner prompt
+  will grow a failure-recovery example at that point.
+- **Resource conflict detection / locking.** Tasks declare `resources`,
+  but the scheduler does not yet enforce exclusion. A follow-up design
+  will turn this into real locks or conflict-serialization.
+- **Cross-task shared Python state.** Workers get a read-only snapshot
+  of parent state; writes happen only on merge when a task completes.
+  Richer sharing (e.g. shared variables) is deferred.
+- **Async (asyncio) model APIs.** We use process parallelism because the
+  bottleneck is LLM latency + Python execution, which process workers
+  handle well without touching the `Model` API. An async path can be
+  added later without changing the graph / planner.
+- **Streaming inside a sub-task to the outer UI.** Token streams from
+  workers are not piped to the parent live view in this iteration.
+  (Tied to progress reporting above.)
+
+## 15. Rollout Plan
+
+Initial slice (this design):
+
+1. Land `task_graph.py` + tests. No behavioral change.
+2. Land `events.py` (lifecycle events only) and `scheduler.py` with
+   fake-task tests.
+3. Land `planner.py` + prompt template + tests with mocked model.
+4. Land `parallel/agent.py` and wire up `ParallelCodeAgent`
+   (happy-path only; fail-fast on any task exception).
+5. Add `parallel_execution` convenience flag on `CodeAgent`.
+6. Docs + examples in `playground/`.
+
+Follow-up slices (not part of this design, each tracked in §14):
+
+7. Progress reporting — `multiprocessing.Queue` pipeline,
+   `TaskProgressEvent`, `Task.progress` field, prompt surfacing.
+8. Failure handling — retries, `TaskStatus.CANCELLED`,
+   `graph.cancel_descendants`, `TaskFailedEvent` /
+   `TaskCancelledEvent`, replan-on-failure, `max_total_failures`,
+   failure-recovery example in the planner prompt.
+9. Resource conflict detection / locking.
+
+Each step is independently reviewable and ships behind the off-by-default
+flag, so main stays green throughout.
