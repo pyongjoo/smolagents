@@ -1524,6 +1524,17 @@ class CodeAgent(MultiStepAgent):
         **kwargs: Additional keyword arguments.
     """
 
+    def __new__(cls, *args, parallel_execution: bool = False, **kwargs):
+        # Convenience dispatch: ``CodeAgent(..., parallel_execution=True)``
+        # instantiates a :class:`ParallelCodeAgent` instead. Only triggers
+        # when the caller is using the plain ``CodeAgent`` class so that
+        # explicit subclassing keeps its normal behaviour.
+        if parallel_execution and cls is CodeAgent:
+            from smolagents.parallel.agent import ParallelCodeAgent
+
+            cls = ParallelCodeAgent
+        return object.__new__(cls)
+
     def __init__(
         self,
         tools: list[Tool],
@@ -1540,6 +1551,8 @@ class CodeAgent(MultiStepAgent):
         code_block_tags: str | tuple[str, str] | None = None,
         **kwargs,
     ):
+        # Strip the dispatch flag so it doesn't propagate to ``super()``.
+        kwargs.pop("parallel_execution", None)
         self.additional_authorized_imports = additional_authorized_imports if additional_authorized_imports else []
         self.authorized_imports = sorted(set(BASE_BUILTIN_MODULES) | set(self.additional_authorized_imports))
         self.max_print_outputs_length = max_print_outputs_length

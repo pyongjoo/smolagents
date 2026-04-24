@@ -30,3 +30,4 @@ from .serialization import *
 from .tools import *
 from .utils import *
 from .cli import *
+from .parallel import ParallelCodeAgent  # noqa: F401 — opt-in parallel execution

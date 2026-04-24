@@ -211,6 +211,51 @@ class FinalAnswerStep(MemoryStep):
     output: Any
 
 
+@dataclass
+class ParallelPlanningStep(PlanningStep):
+    """A planning step produced by the parallel planner.
+
+    Extends :class:`PlanningStep` with the YAML snapshot of the graph
+    that was shown to the LLM and the ids of the tasks the planner
+    added in this call. ``next_trigger`` is the serialized form of
+    ``NextPlanningTrigger`` (kept as a plain dict to avoid coupling
+    memory to the parallel package).
+    """
+
+    graph_snapshot_yaml: str = ""
+    new_task_ids: list[str] = None  # type: ignore[assignment]
+    next_trigger: dict = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.new_task_ids is None:
+            self.new_task_ids = []
+        if self.next_trigger is None:
+            self.next_trigger = {"kind": "never"}
+
+
+@dataclass
+class ParallelTaskStep(ActionStep):
+    """An ActionStep wrapping a completed parallel task.
+
+    Carries the task metadata (id, goal, dependencies, etc.) alongside
+    the standard ActionStep fields, so the full inner trace from the
+    worker can be preserved in ``AgentMemory`` and surfaced to the
+    planner on subsequent rounds.
+    """
+
+    task_id: str = ""
+    task_goal: str = ""
+    dependencies: list[str] = None  # type: ignore[assignment]
+    expected_runtime_s: float | None = None
+    resources: list[str] = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.dependencies is None:
+            self.dependencies = []
+        if self.resources is None:
+            self.resources = []
+
+
 class AgentMemory:
     """Memory for the agent, containing the system prompt and all steps taken by the agent.
 
