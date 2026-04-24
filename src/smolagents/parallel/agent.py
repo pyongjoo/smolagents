@@ -481,6 +481,12 @@ class ParallelCodeAgent(CodeAgent):
         if result is not None and self.executor_kind != "thread":
             self._emit_task_panels(task, result)
 
+        # Finally, show what actually lands in the outer AgentMemory.
+        # This is the view the planner will see on its next round via
+        # ``ParallelPlanner._summarize_memory``, so printing it here
+        # makes the planner's next input legible.
+        self._emit_memory_panel(memory_step)
+
     # ------------------------------------------------------------------
     # Per-task rendering
     # ------------------------------------------------------------------
@@ -601,6 +607,51 @@ class ParallelCodeAgent(CodeAgent):
                 ),
                 level=LogLevel.INFO,
             )
+
+    def _emit_memory_panel(self, step: ParallelTaskStep) -> None:
+        """Render the outer-memory view of a just-completed task.
+
+        The planner consumes ``AgentMemory`` on its next call, and for
+        a :class:`ParallelTaskStep` it only sees the task id, goal,
+        dependencies, and a truncated observation (see
+        :meth:`ParallelPlanner._summarize_memory`). Printing exactly
+        those fields here makes the hand-off from execution to the
+        next planning round explicit.
+        """
+        body = Text()
+        body.append("task_id: ", style="dim")
+        body.append(f"{step.task_id}\n", style="bold")
+        body.append("goal: ", style="dim")
+        body.append(f"{_short_result(step.task_goal, 300)}\n")
+        deps = ", ".join(step.dependencies) if step.dependencies else "-"
+        body.append("dependencies: ", style="dim")
+        body.append(f"{deps}\n")
+        if step.action_output is not None:
+            body.append("action_output: ", style="dim")
+            body.append(f"{_short_result(step.action_output, 400)}\n")
+        obs = step.observations or ""
+        if obs:
+            body.append("observations: ", style="dim")
+            body.append(f"{_short_result(obs, 400)}\n")
+        body.append("planner will see: ", style="dim")
+        body.append(
+            f"- completed {step.task_id}: "
+            f"{_short_result(step.task_goal, 120)} -> "
+            f"{_short_result(obs or step.action_output, 160)}",
+            style="italic",
+        )
+
+        panel = Panel(
+            body,
+            title=f"[bold]{step.task_id} · stored in AgentMemory as ParallelTaskStep",
+            border_style=YELLOW_HEX,
+            title_align="left",
+            box=box.ROUNDED,
+        )
+        # Take the shared lock so the panel doesn't interleave with a
+        # concurrent worker's live step panels in thread mode.
+        with self._print_lock:
+            self.logger.log(panel, level=LogLevel.INFO)
 
     def _make_parallel_task_step(self, task: Task) -> ParallelTaskStep:
         duration = task.actual_runtime_s or 0.0

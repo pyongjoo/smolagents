@@ -70,36 +70,3 @@ elapsed = time.time() - start
 print("=" * 60)
 print(f"Final answer: {result}")
 print(f"Wall-clock time: {elapsed:.2f}s")
-
-
-def _fmt(ts: float | None) -> str:
-    if ts is None:
-        return "--:--:--.---"
-    return datetime.fromtimestamp(ts).strftime("%H:%M:%S.%f")[:-3]
-
-
-print("Tasks in graph:")
-for step in agent.memory.steps:
-    cls = step.__class__.__name__
-    if cls == "ParallelTaskStep":
-        created = _fmt(getattr(step, "created_at", None))
-        started = _fmt(step.timing.start_time)
-        finished = _fmt(step.timing.end_time)
-        duration = step.timing.duration
-        dur_str = f"{duration:.2f}s" if duration is not None else "-"
-        goal_line = step.task_goal.strip().splitlines()[0][:80] if step.task_goal else ""
-        print(
-            f"  - {step.task_id:<10} "
-            f"created={created}  started={started}  finished={finished}  "
-            f"wall={dur_str}  :: {goal_line}"
-        )
-    elif cls == "ParallelPlanningStep":
-        started = _fmt(step.timing.start_time)
-        finished = _fmt(step.timing.end_time)
-        invoked_by = _describe_trigger(getattr(step, "invoked_by", None))
-        next_trigger = _describe_trigger(getattr(step, "next_trigger", None))
-        print(
-            f"  - [planning] started={started}  finished={finished}  "
-            f"invoked_by: {invoked_by}  |  next: {next_trigger}  "
-            f"|  added tasks: {step.new_task_ids}"
-        )
